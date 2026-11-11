@@ -1,0 +1,4 @@
+.venv/
+__pycache__/
+# Test backgrounds are converted macOS wallpapers; recreate locally, do not commit.
+assets/bg/

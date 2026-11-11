@@ -1,0 +1,109 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Astracode mockup</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 24px; background: #f2f2f2; color: #111; display: flex; gap: 32px; flex-wrap: wrap; }
+  #controls { width: 300px; display: grid; gap: 12px; align-content: start; }
+  label { display: grid; gap: 4px; }
+  label span { display: flex; justify-content: space-between; }
+  input[type=range], input[type=text] { width: 100%; box-sizing: border-box; }
+  input[type=text] { font: 16px ui-monospace, monospace; padding: 4px 6px; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  #previews { display: flex; gap: 24px; align-items: flex-start; flex-wrap: wrap; }
+  #small { display: grid; gap: 16px; }
+  #nibbles { font: 12px ui-monospace, monospace; color: #555; word-break: break-all; }
+</style>
+
+<div id="controls">
+  <label><span>12-digit number</span><input type="text" id="num" maxlength="12" value="123456789012"></label>
+  <div class="row">
+    <button id="rand">Random</button>
+    <button id="full">All limbs</button>
+    <button id="empty">No limbs</button>
+  </div>
+  <label><span>Star size (outer radius) <b id="vStar"></b></span><input type="range" id="star" min="8" max="26" step="0.5" value="19.5"></label>
+  <label><span>Logo crop circle diameter <b id="vLogo"></b></span><input type="range" id="logo" min="80" max="280" step="1" value="180"></label>
+  <label><span>Margin around ring <b id="vPad"></b></span><input type="range" id="pad" min="0" max="40" step="1" value="16"></label>
+  <div class="row">
+    <label>Ink <input type="color" id="fg" value="#021639"></label>
+    <label>Background <input type="color" id="bg" value="#febc5c"></label>
+    <button id="swap">Swap</button>
+  </div>
+  <div id="nibbles"></div>
+  <div style="color:#555">Ring radius is fixed at 100; all sizes are relative to it. The scanner expects the defaults (star 19.5, logo 180); other values are for looking only. Stars are regular pentagrams. Stars 11 and 12 are check symbols.</div>
+</div>
+
+<div id="previews">
+  <div id="big"></div>
+  <div id="small"></div>
+</div>
+
+<script>
+const LOGO = `<path d="M338.37,465.61c23-62.6,49.94-122.56,81.41-172.56,19.82,31.52,37.88,67,54.29,104.62a1242.84,1242.84,0,0,1,128.34-46.05C485.58,134.07,419.78,91.42,419.78,91.42s-78.92,51.16-217.27,327C169,485.21,134,563.55,99.17,654.68,152.15,594.63,228.47,529.46,338.37,465.61Z"/><path d="M590.17,543.37c-16.66,11.13-34.06,23.38-51.87,36.74,49.12,170.74,70.06,328.47,70.06,328.47H825.5C776.38,741,723.47,603.64,672.6,492.63,646.63,507.34,618.78,524.25,590.17,543.37Z"/><path d="M982.17,298.05l-98-5.3-38.63-90.22a4,4,0,0,0-7.39.13l-35.32,91.58-97.75,8.86a4,4,0,0,0-2.16,7.07l51.57,41.89a1245.36,1245.36,0,0,0-135.25,31.47,1205.4,1205.4,0,0,0-131.61,46.65A1107.27,1107.27,0,0,0,384.41,480q-34.05,18.71-64,37.47c-149,93.34-225.58,186.86-264.91,259-42.9,78.78-41.47,132.11-41.47,132.11H231.19c58.29-158.17,179.5-278.94,296.43-364.38a1326.91,1326.91,0,0,1,130-83.58c46.2-26.07,86.34-45.26,114.42-57.74l-14.77,64.88a4,4,0,0,0,6.06,4.24l82.4-53.33L930.06,469a4,4,0,0,0,5.9-4.46l-25.25-94.84L984.58,305A4,4,0,0,0,982.17,298.05Z"/>`;
+// Placement from the source file: a 3840 square whose centre is the code's centre. Not re-centred.
+const LOGO_SRC = 3840, LOGO_TF = 'translate(744.90 729.60) scale(2.671645) translate(-14.05 -91.42)';
+const R = 100;
+const RATIO = Math.sin(Math.PI / 10) / Math.sin(3 * Math.PI / 10); // regular pentagram
+const $ = id => document.getElementById(id);
+let override = null; // null | 15 | 0
+
+// Star centred at (cx, cy). Top limb always present; bits 3..0 = limbs clockwise from upper right.
+function star(cx, cy, ro, ratio, nibble) {
+  const ri = ro * ratio, pts = [];
+  const p = (r, deg) => {
+    const a = deg * Math.PI / 180;
+    pts.push((cx + r * Math.cos(a)).toFixed(2) + ',' + (cy + r * Math.sin(a)).toFixed(2));
+  };
+  for (let k = 0; k < 5; k++) {
+    p(ri, -90 - 36 + 72 * k);
+    if (k === 0 || (nibble >> (4 - k)) & 1) p(ro, -90 + 72 * k);
+  }
+  return `<polygon points="${pts.join(' ')}"/>`;
+}
+
+// --- payload encoding; must match astracode/spec.py ---
+const MASK = [0x5, 0xA, 0x3, 0xC, 0x9, 0x6, 0xE, 0x1, 0x7, 0x8, 0xB, 0x4];
+const GF_EXP = [], GF_LOG = [];
+for (let i = 0, x = 1; i < 15; i++) { GF_EXP[i] = GF_EXP[i + 15] = x; GF_LOG[x] = i; x <<= 1; if (x & 16) x ^= 0x13; }
+const gfMul = (a, b) => (a && b) ? GF_EXP[GF_LOG[a] + GF_LOG[b]] : 0;
+
+// Number -> the 12 symbols as drawn: 10 data symbols, 2 Reed-Solomon check symbols, masked.
+function encode(numStr) {
+  let n = BigInt(numStr || '0');
+  const data = [];
+  for (let i = 0; i < 10; i++) { data.unshift(Number(n & 15n)); n >>= 4n; }
+  let r1 = 0, r0 = 0;
+  for (const d of data) { const f = d ^ r1; r1 = r0 ^ gfMul(f, 3); r0 = gfMul(f, 2); }
+  return [...data, r1, r0].map((c, i) => c ^ MASK[i]);
+}
+// --- end payload encoding ---
+
+function render() {
+  const ro = +$('star').value, ratio = RATIO, lh = +$('logo').value, pad = +$('pad').value, fg = $('fg').value, bg = $('bg').value;
+  $('vStar').textContent = ro; $('vLogo').textContent = lh; $('vPad').textContent = pad;
+  const num = $('num').value.replace(/\D/g, '');
+  const nib = override === null ? encode(num) : Array(12).fill(override);
+  $('nibbles').textContent = 'symbols: ' + nib.map(x => x.toString(16)).join(' ');
+
+  let stars = '';
+  for (let i = 0; i < 12; i++) {
+    const a = (-90 + 30 * i) * Math.PI / 180;
+    stars += star(R * Math.cos(a), R * Math.sin(a), ro, ratio, nib[i]);
+  }
+  const half = R + ro + pad, k = lh / LOGO_SRC;
+  const svg = size => `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="${-half} ${-half} ${2 * half} ${2 * half}">
+    <rect x="${-half}" y="${-half}" width="${2 * half}" height="${2 * half}" fill="${bg}"/>
+    <g fill="${fg}">${stars}
+      <g transform="scale(${k}) translate(${-LOGO_SRC / 2} ${-LOGO_SRC / 2}) ${LOGO_TF}">${LOGO}</g>
+    </g></svg>`;
+  $('big').innerHTML = svg(560);
+  $('small').innerHTML = svg(160) + svg(80) + svg(40);
+}
+
+for (const el of document.querySelectorAll('input')) el.addEventListener('input', () => { if (el.id === 'num') override = null; render(); });
+$('rand').onclick = () => { override = null; $('num').value = String(Math.floor(Math.random() * 1e12)).padStart(12, '0'); render(); };
+$('full').onclick = () => { override = 15; render(); };
+$('empty').onclick = () => { override = 0; render(); };
+$('swap').onclick = () => { const t = $('fg').value; $('fg').value = $('bg').value; $('bg').value = t; render(); };
+render();
+</script>

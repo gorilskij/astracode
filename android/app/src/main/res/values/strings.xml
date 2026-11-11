@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Astracode</string>
+    <string name="hint_scanning">Point the camera at an Astra code</string>
+    <string name="hint_no_camera">Camera access is needed to scan codes</string>
+    <string name="allow_camera">Allow camera</string>
+    <string name="copy">Copy</string>
+    <string name="copied">Copied</string>
+    <string name="scan_again">Scan again</string>
+</resources>
