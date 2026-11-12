@@ -7,8 +7,9 @@ phones, on the web and on servers.
 
 ```
 rust/
-  astracode/        the library
-  astracode-cli/    the `astracode` command: scan images, draw codes
+  astracode/          the library
+  astracode-cli/      the `astracode` command: scan images, draw codes
+  astracode-android/  the scanner as a native library for the Android app
 ```
 
 ## Using it
@@ -37,6 +38,22 @@ for code in scan_rgb8(width, height, &rgb_pixels, &Options::default()) {
 gives and avoids the colour-channel fallback. `Options::find_size` looks for
 stars in a shrunken copy of the frame, for a live preview where frame rate
 matters more than small codes.
+
+## On Android
+
+The app in `../android` contains no scanner of its own. `astracode-android`
+exposes one native function, `NativeScanner.scan`, which takes the camera
+frame's brightness plane and returns the codes found packed into a byte array;
+the layout is documented at `encode` in its `lib.rs` and unpacked by
+`Scanner.kt`.
+
+`../android/build-rust.sh` builds it with the NDK into the app's `jniLibs`,
+and Gradle runs that script before every build, so `./gradlew assembleDebug`
+is all that is needed once the Rust target is installed:
+
+```sh
+rustup target add aarch64-linux-android
+```
 
 ## How the library is laid out
 

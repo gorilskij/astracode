@@ -3,3 +3,5 @@ build/
 local.properties
 *.iml
 .idea/
+# Built from rust/ by build-rust.sh
+app/src/main/jniLibs/

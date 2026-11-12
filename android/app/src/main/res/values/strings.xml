@@ -1,11 +1,40 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Astracode</string>
-    <string name="hint_scanning">Point the camera at an Astra code</string>
+    <string name="hint_scanning">Point the camera at an Astracode</string>
     <string name="hint_no_camera">Camera access is needed to scan codes</string>
     <string name="allow_camera">Allow camera</string>
+    <string name="open">Open</string>
     <string name="copy">Copy</string>
     <string name="copied">Copied</string>
     <string name="scan_again">Scan again</string>
-    <string name="result_detail">metadata %1$d · payload %2$010d</string>
+
+    <!-- What kind of code was read. -->
+    <string name="kind_member_id">Member ID</string>
+    <string name="kind_number">Number · type %1$d</string>
+    <string name="kind_link">Link</string>
+    <string name="kind_text">Text</string>
+    <string name="kind_data">Data</string>
+
+    <!-- The line under the result. -->
+    <string name="detail_number">metadata %1$d · payload %2$s</string>
+    <plurals name="detail_message">
+        <item quantity="one">%2$d rings · %1$d byte · error correction %3$d of 3</item>
+        <item quantity="other">%2$d rings · %1$d bytes · error correction %3$d of 3</item>
+    </plurals>
+
+    <!-- How it was read; shown only when something is worth saying. -->
+    <string name="note_mirrored">mirror image</string>
+    <string name="note_bent">bent surface</string>
+    <plurals name="note_repaired_stars">
+        <item quantity="one">%d star repaired</item>
+        <item quantity="other">%d stars repaired</item>
+    </plurals>
+    <plurals name="note_repaired_pairs">
+        <item quantity="one">%d star pair repaired</item>
+        <item quantity="other">%d star pairs repaired</item>
+    </plurals>
+
+    <!-- Frame size and the time the last scan took, for judging performance. -->
+    <string name="status">%1$d × %2$d · %3$d ms</string>
 </resources>

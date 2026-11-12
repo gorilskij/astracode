@@ -56,6 +56,18 @@ impl Gray {
         Gray { width, height, data: pixels.iter().map(|&p| p as f32).collect() }
     }
 
+    /// From 8-bit grey pixels stored as rows of `stride` bytes of which the first
+    /// `width` are pixels, as camera frames are. The last row may be cut short
+    /// after its pixels.
+    pub fn from_luma8_rows(width: usize, height: usize, stride: usize, pixels: &[u8]) -> Gray {
+        assert!(stride >= width && pixels.len() >= stride * (height - 1) + width, "pixel buffer does not match the image size");
+        let mut data = Vec::with_capacity(width * height);
+        for y in 0..height {
+            data.extend(pixels[y * stride..y * stride + width].iter().map(|&p| p as f32));
+        }
+        Gray { width, height, data }
+    }
+
     /// Brightness of 8-bit RGB pixels (`r, g, b, r, g, b, ...`), rounded to
     /// whole levels with the same weights and rounding as OpenCV.
     pub fn from_rgb8(width: usize, height: usize, pixels: &[u8]) -> Gray {

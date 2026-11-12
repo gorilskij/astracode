@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["astracode", "astracode-cli"]
+members = ["astracode", "astracode-cli", "astracode-android"]
 
 [workspace.package]
 version = "0.1.0"

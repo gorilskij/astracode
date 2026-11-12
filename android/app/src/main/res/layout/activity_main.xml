@@ -14,18 +14,38 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <TextView
-        android:id="@+id/hint"
+    <LinearLayout
+        android:id="@+id/top"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="top|center_horizontal"
         android:layout_marginTop="24dp"
-        android:background="@drawable/hint_background"
-        android:paddingHorizontal="18dp"
-        android:paddingVertical="10dp"
-        android:text="@string/hint_scanning"
-        android:textColor="@android:color/white"
-        android:textSize="15sp" />
+        android:gravity="center_horizontal"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/hint"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="@drawable/hint_background"
+            android:paddingHorizontal="18dp"
+            android:paddingVertical="10dp"
+            android:text="@string/hint_scanning"
+            android:textColor="@android:color/white"
+            android:textSize="15sp" />
+
+        <!-- Frame size and scan time. -->
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:fontFamily="monospace"
+            android:shadowColor="#000000"
+            android:shadowRadius="4"
+            android:textColor="#99FFFFFF"
+            android:textSize="11sp" />
+    </LinearLayout>
 
     <Button
         android:id="@+id/allow"
@@ -41,36 +61,83 @@
         android:layout_height="wrap_content"
         android:layout_gravity="bottom"
         android:background="@drawable/panel_background"
-        android:gravity="center_horizontal"
         android:orientation="vertical"
         android:paddingHorizontal="24dp"
-        android:paddingTop="24dp"
+        android:paddingTop="22dp"
         android:paddingBottom="24dp"
         android:visibility="gone">
 
+        <!-- What kind of code this is. -->
+        <TextView
+            android:id="@+id/kind"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:letterSpacing="0.08"
+            android:textAllCaps="true"
+            android:textColor="#B3FFFFFF"
+            android:textSize="12sp" />
+
+        <!-- A member ID or number: short, large. -->
         <TextView
             android:id="@+id/number"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
             android:fontFamily="monospace"
             android:textColor="@color/astra_yellow"
             android:textIsSelectable="true"
             android:textSize="30sp" />
 
+        <!-- A message: as long as it needs to be, scrolling past a few lines. -->
+        <ScrollView
+            android:id="@+id/message_scroll"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/message"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:lineSpacingMultiplier="1.15"
+                android:textColor="@color/astra_yellow"
+                android:textIsSelectable="true"
+                android:textSize="18sp" />
+        </ScrollView>
+
         <TextView
             android:id="@+id/detail"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:fontFamily="monospace"
+            android:layout_marginTop="8dp"
             android:textColor="#B3FFFFFF"
             android:textSize="14sp" />
+
+        <!-- Mirror image, bent surface, repairs. -->
+        <TextView
+            android:id="@+id/notes"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:textColor="#80FFFFFF"
+            android:textSize="13sp"
+            android:visibility="gone" />
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="20dp"
             android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/open"
+                android:layout_width="0dp"
+                android:layout_height="52dp"
+                android:layout_marginEnd="8dp"
+                android:layout_weight="1"
+                android:text="@string/open"
+                android:visibility="gone" />
 
             <Button
                 android:id="@+id/copy"
@@ -84,7 +151,6 @@
                 android:id="@+id/again"
                 android:layout_width="0dp"
                 android:layout_height="52dp"
-                android:layout_marginStart="8dp"
                 android:layout_weight="1"
                 android:text="@string/scan_again" />
         </LinearLayout>
