@@ -1,0 +1,20 @@
+[package]
+name = "astracode"
+description = "Astracode: a scannable code made of rings of stars. Format, generator and scanner."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["parallel"]
+# Spread per-star work over the available cores.
+parallel = ["dep:rayon"]
+
+[dependencies]
+nalgebra = { version = "0.35", default-features = false, features = ["std"] }
+rayon = { version = "1", optional = true }
+thiserror = "2"
+
+[dev-dependencies]
+# Tests render the generator's SVG output and scan it back.
+resvg = { version = "0.50", default-features = false }

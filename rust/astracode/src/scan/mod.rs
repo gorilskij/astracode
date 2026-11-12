@@ -1,0 +1,252 @@
+//! Finding and reading codes in an image.
+//!
+//! [`scan_rgb8`] and [`scan_gray`] are the entry points. The work is laid out
+//! like a QR reader's:
+//!
+//! 1. `blobs`: binarise against the local mean, in both polarities, and
+//!    collect connected regions that could be stars.
+//! 2. `rings`: walk rings of twelve evenly spaced, similar blobs.
+//! 3. `candidate`: fit a homography to a ring, throw out look-alikes
+//!    (`checks`), find which way is up from the star shapes (`align`),
+//!    and read ring 0's limbs (`limbs`). Ring 0 is either a complete
+//!    one-ring code or the header of a bigger one.
+//! 4. `outer`: for a bigger code, locate the remaining rings outwards from
+//!    ring 0 and read the message.
+//! 5. `bent`: when a ring cannot be read as flat, each star's own outline
+//!    gives its local stretch, shear and rotation, and reading is retried
+//!    with those.
+//!
+//! Only steps 1 and 2 use the binarised image; everything after samples grey
+//! levels. Whatever is drawn in the centre of a code is never looked at.
+//!
+//! The scanner is tuned never to return a wrong value: when in doubt it
+//! returns nothing, and the caller scans the next frame.
+
+mod align;
+mod bent;
+mod blobs;
+mod candidate;
+mod checks;
+mod limbs;
+mod outer;
+mod par;
+mod patterns;
+mod rings;
+
+use crate::format::ring0;
+use crate::image::Gray;
+use crate::math::{Homography, LocalMap, Point};
+
+/// Least gap between the light and solid shades, in units of their spread,
+/// for limbs to be read at all.
+pub(crate) const MIN_SHADE_SEPARATION: f64 = 4.0;
+
+/// What a code carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Payload {
+    /// A one-ring code: `metadata * 10^10 + payload`. See [`ring0::unpack`] and
+    /// [`ring0::member_id`].
+    Number(u64),
+    /// A code with more rings: a byte string, written at the given error-correction level.
+    Message { level: u8, bytes: Vec<u8> },
+}
+
+/// A code found in an image.
+#[derive(Debug, Clone)]
+pub struct Code {
+    pub payload: Payload,
+    /// Number of rings, 1 to 24.
+    pub rings: usize,
+    /// The corners of the code's square in the image: top left, top right,
+    /// bottom right, bottom left, as the code itself is oriented.
+    pub corners: [Point; 4],
+    /// Whether the code was seen as a mirror image (through glass, from behind).
+    pub mirrored: bool,
+    /// Stars (one-ring code) or star pairs (message) the error correction repaired.
+    pub repaired: usize,
+    /// Whether reading needed each star's own shape: the surface was far from flat.
+    pub shaped: bool,
+    /// Confidence of the least certain limb, 0 to 1.
+    pub confidence: f64,
+    /// The gap between the light and solid shades, in units of their spread.
+    pub separation: f64,
+    /// How inked the light limbs are relative to solid ones, as measured in this image.
+    pub light_level: f64,
+}
+
+impl Code {
+    /// The metadata and payload of a one-ring code.
+    pub fn number(&self) -> Option<(u64, u64)> {
+        match self.payload {
+            Payload::Number(value) => Some(ring0::unpack(value)),
+            Payload::Message { .. } => None,
+        }
+    }
+
+    /// The bytes of a message code.
+    pub fn message(&self) -> Option<&[u8]> {
+        match &self.payload {
+            Payload::Message { bytes, .. } => Some(bytes),
+            Payload::Number(_) => None,
+        }
+    }
+}
+
+/// Settings for a scan.
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    /// Look for stars in a copy of the image shrunk so that its longer side is
+    /// this many pixels. Quicker on large frames without a code, which suits a
+    /// live preview, but small stars are missed. Reading always uses the full
+    /// image. `None`, the default, looks at full resolution.
+    pub find_size: Option<usize>,
+}
+
+/// One image plane being scanned, with the polarity being tried.
+#[derive(Clone, Copy)]
+pub(crate) struct View<'a> {
+    pub image: &'a Gray,
+    /// `1.0` for dark ink on a light background, `-1.0` for light ink on dark.
+    pub polarity: f64,
+}
+
+/// Where each star of a set is in the image, and its local map: how model
+/// offsets around its centre appear in the image.
+#[derive(Clone)]
+pub(crate) struct Placement {
+    pub at: Vec<Point>,
+    pub maps: Vec<LocalMap>,
+}
+
+impl Placement {
+    /// Stars exactly where a flat fit puts them.
+    pub fn flat(h: &Homography, centers: &[Point]) -> Placement {
+        Placement { at: centers.iter().map(|&c| h.apply(c)).collect(), maps: centers.iter().map(|&c| h.local_map(c)).collect() }
+    }
+
+    /// The first `n` stars.
+    pub fn first(&self, n: usize) -> Placement {
+        Placement { at: self.at[..n].to_vec(), maps: self.maps[..n].to_vec() }
+    }
+}
+
+/// What one frame has cost so far, across its colour planes.
+///
+/// A real ring turns up early. In a code with many rings there are hundreds of
+/// look-alike loops, and in a frame whose code cannot be read the scanner
+/// would otherwise work through all of them.
+#[derive(Default)]
+pub(crate) struct Budget {
+    /// Rings that passed the first checks.
+    plausible: usize,
+    /// Rings that announced more rings. Once one has, no other loop in the
+    /// frame can be the answer.
+    headers: usize,
+    /// The scanner has given up on this frame.
+    gave_up: bool,
+    /// Rings given the bent-surface treatment.
+    bent: usize,
+}
+
+/// Loops of twelve looked at per image plane before giving up.
+const MAX_LOOPS: usize = 600;
+/// Of those, how many may pass the first checks.
+const MAX_PLAUSIBLE: usize = 30;
+
+/// Scan one grey plane.
+fn scan_plane(gray: &Gray, options: &Options, budget: &mut Budget) -> Vec<Code> {
+    if gray.width < 32 || gray.height < 32 {
+        return Vec::new();
+    }
+    // Stars are looked for in `small`; `scale` takes its pixels back to the full image.
+    let scale = match options.find_size {
+        Some(size) => (size as f64 / gray.width.max(gray.height) as f64).min(1.0),
+        None => 1.0,
+    };
+    let shrunk;
+    let small = if scale < 1.0 {
+        shrunk = gray.shrink(scale);
+        &shrunk
+    } else {
+        gray
+    };
+    let passes: Vec<(f64, Vec<blobs::Blob>, rings::Neighbourhood)> = blobs::binarise(small)
+        .into_iter()
+        .map(|(polarity, blobs)| {
+            let neighbourhood = rings::Neighbourhood::new(&blobs);
+            (polarity, blobs, neighbourhood)
+        })
+        .collect();
+
+    let mut results: Vec<Code> = Vec::new();
+    let mut tried: Vec<candidate::Marks> = Vec::new();
+    let (mut loops, plausible_before) = (0usize, budget.plausible);
+    // First only blobs with few similar neighbours, which is quick and finds a code on
+    // its own; then more crowded ones; last everything, which a code with several
+    // rings needs, since all its stars are crowded.
+    for max_crowd in [rings::CROWD, 2 * rings::CROWD, usize::MAX] {
+        for (polarity, blobs, neighbourhood) in &passes {
+            let view = View { image: gray, polarity: *polarity };
+            let mut finished = false;
+            rings::find_rings(neighbourhood, max_crowd, |ring| {
+                loops += 1;
+                if loops > MAX_LOOPS || budget.plausible - plausible_before > MAX_PLAUSIBLE {
+                    budget.gave_up = true;
+                }
+                if budget.headers > 0 || budget.gave_up {
+                    finished = true;
+                    return false;
+                }
+                let centres: Vec<Point> = ring.blobs.iter().map(|&i| [blobs[i as usize].x / scale, blobs[i as usize].y / scale]).collect();
+                let areas: Vec<f64> = ring.blobs.iter().map(|&i| blobs[i as usize].area / (scale * scale)).collect();
+                if let Some(code) = candidate::read_candidate(view, &centres, &ring.slots, &areas, &mut tried, budget) {
+                    if results.iter().all(|r| r.payload != code.payload) {
+                        results.push(code);
+                    }
+                }
+                // In the slow pass one code is enough.
+                if !results.is_empty() && max_crowd == usize::MAX {
+                    finished = true;
+                    return false;
+                }
+                true
+            });
+            if finished {
+                return results;
+            }
+        }
+        if !results.is_empty() || budget.headers > 0 {
+            break;
+        }
+    }
+    results
+}
+
+/// Find and read the codes in a grey image.
+pub fn scan_gray(gray: &Gray, options: &Options) -> Vec<Code> {
+    scan_plane(gray, options, &mut Budget::default())
+}
+
+/// Find and read the codes in an 8-bit RGB image (`r, g, b, r, g, b, ...`, row by row).
+///
+/// Brightness is tried first. If that finds nothing, each colour channel is
+/// tried on its own, for ink and background colours that are alike in brightness.
+pub fn scan_rgb8(width: usize, height: usize, pixels: &[u8], options: &Options) -> Vec<Code> {
+    let mut budget = Budget::default();
+    let results = scan_plane(&Gray::from_rgb8(width, height, pixels), options, &mut budget);
+    if !results.is_empty() {
+        return results;
+    }
+    for channel in [2, 1, 0] {
+        // If brightness showed a ring 0 whose outer rings could not be read, or a crowd of
+        // stars with no readable ring among them, the single channels will not do better.
+        if budget.headers > 0 || budget.gave_up {
+            break;
+        }
+        let results = scan_plane(&Gray::from_rgb8_channel(width, height, pixels, channel), options, &mut budget);
+        if !results.is_empty() {
+            return results;
+        }
+    }
+    Vec::new()
+}

@@ -27,6 +27,16 @@ from astracode import decode, render, spec
 # ASTRA_SHADE=0.5 renders the light limbs at another level (the scanner works it out for itself).
 spec.SHADE = float(os.environ.get("ASTRA_SHADE", spec.SHADE))
 
+# Worker processes: three quarters of the cores by default, so the machine stays usable.
+# Set ASTRA_WORKERS to change it.
+WORKERS = int(os.environ.get("ASTRA_WORKERS", max(1, os.cpu_count() * 3 // 4)))
+
+
+def workers(rings):
+    """Worker processes for a run. Frames for codes above 12 rings are 2560 x 1920 and each
+    worker holds several copies as floats, so those runs are limited by memory, not cores."""
+    return WORKERS if rings[1] <= 12 else min(WORKERS, 4)
+
 FRAME_W, FRAME_H = 960, 720
 SRC_PPU = 3.0
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -320,7 +330,7 @@ def main():
         del args[i:i + 2]
     count = int(args[0]) if args else 1000
     level = float(args[1]) if len(args) > 1 else 1.0
-    with Pool() as pool:
+    with Pool(workers(rings)) as pool:
         rows = pool.map(run_case, [(s, level, rings, wavy) for s in range(count)], chunksize=4)
         neg = pool.map(run_negative, range(10 ** 6, 10 ** 6 + count // 2), chunksize=8)
     ok = sum(r["result"] == "ok" for r in rows)
