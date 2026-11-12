@@ -1,13 +1,16 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>Astracode mockup</title>
+<title>Astracode generator</title>
 <style>
   body { font: 14px system-ui, sans-serif; margin: 24px; background: #f2f2f2; color: #111; display: flex; gap: 32px; flex-wrap: wrap; }
   #controls { width: 300px; display: grid; gap: 12px; align-content: start; }
   label { display: grid; gap: 4px; }
   label span { display: flex; justify-content: space-between; }
-  input[type=range], input[type=text] { width: 100%; box-sizing: border-box; }
-  input[type=text] { font: 16px ui-monospace, monospace; padding: 4px 6px; }
+  input[type=range], input[type=text], input[type=number] { width: 100%; box-sizing: border-box; }
+  input[type=text], input[type=number] { font: 16px ui-monospace, monospace; padding: 4px 6px; }
+  #summary { font: 13px ui-monospace, monospace; line-height: 1.5; }
+  #summary b { font-size: 16px; }
+  .bad { color: #b00020; }
   .row { display: flex; gap: 8px; align-items: center; }
   #previews { display: flex; gap: 24px; align-items: flex-start; flex-wrap: wrap; }
   #small { display: grid; gap: 16px; }
@@ -15,12 +18,15 @@
 </style>
 
 <div id="controls">
-  <label><span>12-digit number</span><input type="text" id="num" maxlength="12" value="123456789012"></label>
+  <label><span>Metadata (0–108)</span><input type="number" id="meta" min="0" max="108" step="1" value="0"></label>
+  <label><span>Payload (up to 10 digits)</span><input type="text" id="num" inputmode="numeric" maxlength="10" value="4320880580"></label>
+  <div id="summary"></div>
   <div class="row">
     <button id="rand">Random</button>
     <button id="full">All solid</button>
     <button id="empty">All light</button>
   </div>
+  <label><span>Light limb level, % ink <b id="vShade"></b></span><input type="range" id="shade" min="40" max="95" step="5" value="80"></label>
   <label><span>Star size (outer radius) <b id="vStar"></b></span><input type="range" id="star" min="8" max="26" step="0.5" value="19.5"></label>
   <label><span>Logo crop circle diameter <b id="vLogo"></b></span><input type="range" id="logo" min="80" max="280" step="1" value="180"></label>
   <label><span>Margin around ring <b id="vPad"></b></span><input type="range" id="pad" min="0" max="40" step="1" value="16"></label>
@@ -30,7 +36,7 @@
     <button id="swap">Swap</button>
   </div>
   <div id="nibbles"></div>
-  <div style="color:#555">Ring radius is fixed at 100; all sizes are relative to it. The scanner expects the defaults (star 19.5, logo 180); other values are for looking only. Every star is a full pentagram: each limb is solid or 70% ink, the centre is always solid. Stars 9 to 12 are check symbols.</div>
+  <div style="color:#555">Ring radius is fixed at 100; all sizes are relative to it. The scanner expects the defaults (star 19.5, logo 180); other values are for looking only. Every star is a full pentagram: each limb is solid or the lighter level, the centre is always solid; the scanner works out the lighter level for itself. The code stores metadata × 10¹⁰ + payload in 40 bits; stars 9 to 12 are check symbols. A member ID is the 10-digit payload followed by payload mod 97.</div>
 </div>
 
 <div id="previews">
@@ -47,7 +53,6 @@ const RATIO = Math.sin(Math.PI / 10) / Math.sin(3 * Math.PI / 10); // regular pe
 const $ = id => document.getElementById(id);
 let override = null; // null | 15 | 0
 
-const SHADE = 0.7;   // ink fraction of a light limb
 const P = (cx, cy, r, deg) => {
   const a = deg * Math.PI / 180;
   return (cx + r * Math.cos(a)).toFixed(3) + ',' + (cy + r * Math.sin(a)).toFixed(3);
@@ -86,9 +91,32 @@ const gfMul = (a, b) => (a && b) ? GF_EXP[GF_LOG[a] + GF_LOG[b]] : 0;
 let GEN = [1];
 for (let j = 0; j < 4; j++) GEN = [...GEN, 0].map((x, i) => x ^ gfMul(i ? GEN[i - 1] : 0, GF_EXP[j]));
 
-// Number -> the 12 symbols as drawn: 8 data symbols (5 bits each), 4 Reed-Solomon check symbols, masked.
-function encode(numStr) {
-  let n = BigInt(numStr || '0');
+// The stored 40-bit value: metadata 0..108 and a 10-digit payload.
+const PAYLOAD_LIMIT = 10n ** 10n, METADATA_LIMIT = (1n << 40n) / PAYLOAD_LIMIT;   // 109
+const pack = (metadata, payload) => BigInt(metadata) * PAYLOAD_LIMIT + BigInt(payload);
+// 12-digit member ID: the payload, then payload mod 97.
+const memberId = payload => String(payload).padStart(10, '0') + String(BigInt(payload) % 97n).padStart(2, '0');
+
+// Fixed, public, reversible scramble of the 40-bit value (a 4-round Feistel network on its
+// two 20-bit halves), so neighbouring values give unrelated-looking codes. Not encryption.
+const MIX_KEYS = [0x3C6EF, 0x1B873, 0x5A827, 0x6ED9E];
+function mixRound(x, key) {
+  let t = Math.imul(x + key, 0x9E3779B1) >>> 0;
+  t ^= t >>> 15;
+  t = Math.imul(t, 0x85EBCA77) >>> 0;
+  t ^= t >>> 13;
+  return t & 0xFFFFF;
+}
+function mix(value) {
+  let left = Number(value >> 20n), right = Number(value & 0xFFFFFn);
+  for (const key of MIX_KEYS) [left, right] = [right, left ^ mixRound(right, key)];
+  return BigInt(left) << 20n | BigInt(right);
+}
+
+// Stored value -> the 12 symbols as drawn: mixed, then 8 data symbols (5 bits each) and
+// 4 Reed-Solomon check symbols, masked.
+function encode(value) {
+  let n = mix(BigInt(value));
   const data = [];
   for (let i = 0; i < 8; i++) { data.unshift(Number(n & 31n)); n >>= 5n; }
   let rem = [0, 0, 0, 0];
@@ -103,8 +131,18 @@ function encode(numStr) {
 function render() {
   const ro = +$('star').value, lh = +$('logo').value, pad = +$('pad').value, fg = $('fg').value, bg = $('bg').value;
   $('vStar').textContent = ro; $('vLogo').textContent = lh; $('vPad').textContent = pad;
-  const num = $('num').value.replace(/\D/g, '');
-  const nib = override === null ? encode(num) : Array(12).fill(override);
+  const shade = +$('shade').value / 100;
+  $('vShade').textContent = $('shade').value;
+  const payload = $('num').value.replace(/\D/g, '') || '0';
+  const meta = Math.trunc(+$('meta').value);
+  const metaOk = Number.isFinite(meta) && meta >= 0 && meta < Number(METADATA_LIMIT);
+  if (!metaOk) {
+    $('summary').innerHTML = '<span class="bad">Metadata must be a whole number from 0 to 108.</span>';
+    return;
+  }
+  const value = pack(meta, payload);
+  $('summary').innerHTML = `member ID <b>${memberId(payload).replace(/(....)(....)(....)/, '$1 $2 $3')}</b><br>stored value ${value} (${value.toString(2).length} of 40 bits)`;
+  const nib = override === null ? encode(value) : Array(12).fill(override);
   $('nibbles').textContent = 'symbols: ' + nib.map(x => x.toString(32)).join(' ');
 
   let stars = '', light = '';
@@ -116,7 +154,7 @@ function render() {
   const half = R + ro + pad, k = lh / LOGO_SRC;
   const svg = size => `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="${-half} ${-half} ${2 * half} ${2 * half}">
     <rect x="${-half}" y="${-half}" width="${2 * half}" height="${2 * half}" fill="${bg}"/>
-    <g fill="${mix(bg, fg, SHADE)}">${light}</g>
+    <g fill="${mix(bg, fg, shade)}">${light}</g>
     <g fill="${fg}">${stars}
       <g transform="scale(${k}) translate(${-LOGO_SRC / 2} ${-LOGO_SRC / 2}) ${LOGO_TF}">${LOGO}</g>
     </g></svg>`;
@@ -124,8 +162,8 @@ function render() {
   $('small').innerHTML = svg(160) + svg(80) + svg(40);
 }
 
-for (const el of document.querySelectorAll('input')) el.addEventListener('input', () => { if (el.id === 'num') override = null; render(); });
-$('rand').onclick = () => { override = null; $('num').value = String(Math.floor(Math.random() * 1e12)).padStart(12, '0'); render(); };
+for (const el of document.querySelectorAll('input')) el.addEventListener('input', () => { if (el.id === 'num' || el.id === 'meta') override = null; render(); });
+$('rand').onclick = () => { override = null; $('num').value = String(Math.floor(Math.random() * 1e10)).padStart(10, '0'); render(); };
 $('full').onclick = () => { override = 31; render(); };
 $('empty').onclick = () => { override = 0; render(); };
 $('swap').onclick = () => { const t = $('fg').value; $('fg').value = $('bg').value; $('bg').value = t; render(); };

@@ -462,7 +462,9 @@ def _read_candidate(gray, centres, slots, pol, debug=None):
     number, repaired = decoded
     outline = _apply(H, np.array([[-spec.HALF, -spec.HALF], [spec.HALF, -spec.HALF],
                                   [spec.HALF, spec.HALF], [-spec.HALF, spec.HALF]]))
-    return dict(number=number, text="%012d" % number, corners=outline, repaired=repaired,
+    metadata, payload = spec.unpack(number)
+    return dict(number=number, text="%012d" % number, metadata=metadata, payload=payload,
+                member_id=spec.member_id(payload), corners=outline, repaired=repaired,
                 confidence=float(conf.min()), logo_score=logo_score, separation=separation,
                 ratio=ratio, bit_confidence=conf)
 
@@ -513,4 +515,5 @@ if __name__ == "__main__":
             print(path, "cannot read")
             continue
         found = scan(img)
-        print(path, ", ".join(r["text"] for r in found) or "no code")
+        print(path, ", ".join("metadata %d, payload %010d (member ID %s)" % (r["metadata"], r["payload"], r["member_id"])
+                              for r in found) or "no code")

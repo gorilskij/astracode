@@ -30,6 +30,7 @@ import androidx.core.view.updatePadding
 import app.astracode.scanner.decode.Decoder
 import app.astracode.scanner.decode.Gray
 import app.astracode.scanner.decode.ScanResult
+import app.astracode.scanner.decode.Spec
 import java.util.concurrent.Executors
 import kotlin.math.max
 
@@ -45,6 +46,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var allow: Button
     private lateinit var panel: View
     private lateinit var numberView: TextView
+    private lateinit var detailView: TextView
 
     private val analysisExecutor = Executors.newSingleThreadExecutor()
     private var luma = ByteArray(0)
@@ -67,6 +69,7 @@ class MainActivity : ComponentActivity() {
         allow = findViewById(R.id.allow)
         panel = findViewById(R.id.panel)
         numberView = findViewById(R.id.number)
+        detailView = findViewById(R.id.detail)
 
         val hintTop = (hint.layoutParams as android.widget.FrameLayout.LayoutParams).topMargin
         val panelBottom = panel.paddingBottom
@@ -81,7 +84,7 @@ class MainActivity : ComponentActivity() {
         allow.setOnClickListener { askPermission.launch(Manifest.permission.CAMERA) }
         findViewById<Button>(R.id.copy).setOnClickListener {
             val clipboard = getSystemService(ClipboardManager::class.java)
-            clipboard.setPrimaryClip(ClipData.newPlainText(getString(R.string.app_name), "%012d".format(result)))
+            clipboard.setPrimaryClip(ClipData.newPlainText(getString(R.string.app_name), Spec.memberId(result % Spec.PAYLOAD_LIMIT)))
             (it as Button).setText(R.string.copied)
         }
         findViewById<Button>(R.id.again).setOnClickListener { resumeScanning() }
@@ -188,8 +191,10 @@ class MainActivity : ComponentActivity() {
         paused = true
         result = number
         overlay.show(corners, true)
-        val digits = "%012d".format(number)
-        numberView.text = digits.chunked(4).joinToString(" ")
+        // Shown as a member ID: the 10-digit payload plus its two mod-97 check digits.
+        val payload = number % Spec.PAYLOAD_LIMIT
+        numberView.text = Spec.memberId(payload).chunked(4).joinToString(" ")
+        detailView.text = getString(R.string.result_detail, number / Spec.PAYLOAD_LIMIT, payload)
         findViewById<Button>(R.id.copy).setText(R.string.copy)
         hint.visibility = View.GONE
         panel.visibility = View.VISIBLE

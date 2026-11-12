@@ -12,6 +12,9 @@ import kotlin.math.sin
  * star is a complete pentagram with a solid centre; each limb is solid (bit 1) or
  * a lighter shade (bit 0). The top limb is bit 4 of the star's symbol, then
  * clockwise bits 3, 2, 1, 0.
+ *
+ * The 40 stored bits hold metadata * 10^10 + payload: a 10-digit payload and a
+ * metadata value 0..108 saying what the payload is.
  */
 object Spec {
     const val R = 100.0
@@ -23,7 +26,9 @@ object Spec {
     const val N_STARS = 12
     const val N_DATA = 8
     const val N_CHECK = N_STARS - N_DATA
-    const val MAX_NUMBER = 1_000_000_000_000L
+    const val PAYLOAD_LIMIT = 10_000_000_000L              // payloads are 0 .. PAYLOAD_LIMIT - 1
+    const val METADATA_LIMIT = (1L shl 40) / PAYLOAD_LIMIT    // 109: metadata is 0 .. 108
+    const val MAX_NUMBER = METADATA_LIMIT * PAYLOAD_LIMIT     // every stored value is below this
 
     private val MASK = intArrayOf(0x15, 0x0A, 0x13, 0x1C, 0x09, 0x06, 0x1E, 0x01, 0x17, 0x08, 0x1B, 0x04)
 
@@ -55,11 +60,57 @@ object Spec {
     private fun gfMul(a: Int, b: Int) = if (a == 0 || b == 0) 0 else EXP[LOG[a] + LOG[b]]
     private fun gfDiv(a: Int, b: Int) = if (a == 0) 0 else EXP[LOG[a] - LOG[b] + 31]
 
-    /** Number -> the 12 symbols as drawn (8 data, 4 Reed-Solomon check, masked). */
+    // Fixed, public, reversible scramble of the 40-bit value (a 4-round Feistel network
+    // on its two 20-bit halves), so codes for neighbouring values look unrelated and use
+    // both shades evenly. Not encryption. Must match mix() in astracode/spec.py.
+    private val MIX_KEYS = intArrayOf(0x3C6EF, 0x1B873, 0x5A827, 0x6ED9E)
+
+    private fun mixRound(x: Int, key: Int): Int {
+        var t = (x + key) * -0x61c8864f           // 0x9E3779B1 as a 32-bit int
+        t = t xor (t ushr 15)
+        t *= -0x7a143589                          // 0x85EBCA77
+        t = t xor (t ushr 13)
+        return t and 0xFFFFF
+    }
+
+    fun mix(value: Long): Long {
+        var left = (value ushr 20).toInt()
+        var right = (value and 0xFFFFF).toInt()
+        for (key in MIX_KEYS) {
+            val next = left xor mixRound(right, key)
+            left = right
+            right = next
+        }
+        return (left.toLong() shl 20) or right.toLong()
+    }
+
+    fun unmix(value: Long): Long {
+        var left = (value ushr 20).toInt()
+        var right = (value and 0xFFFFF).toInt()
+        for (i in MIX_KEYS.indices.reversed()) {
+            val prev = right xor mixRound(left, MIX_KEYS[i])
+            right = left
+            left = prev
+        }
+        return (left.toLong() shl 20) or right.toLong()
+    }
+
+    /** Metadata 0..108 and a 10-digit payload -> the stored 40-bit value, metadata * 10^10 + payload. */
+    fun pack(metadata: Int, payload: Long): Long {
+        require(metadata in 0 until METADATA_LIMIT) { "metadata must be 0..${METADATA_LIMIT - 1}" }
+        require(payload in 0 until PAYLOAD_LIMIT) { "payload must have at most 10 digits" }
+        return metadata * PAYLOAD_LIMIT + payload
+    }
+
+    /** The 12-digit member ID for a 10-digit payload: the payload, then payload mod 97. */
+    fun memberId(payload: Long): String = "%010d%02d".format(payload, payload % 97)
+
+    /** Stored value (see [pack]) -> the 12 symbols as drawn (8 data, 4 Reed-Solomon check, masked). */
     fun encode(number: Long): IntArray {
-        require(number in 0 until MAX_NUMBER) { "number must have at most 12 digits" }
+        require(number in 0 until MAX_NUMBER) { "value out of range" }
+        val mixed = mix(number)
         val cw = IntArray(N_STARS)
-        for (i in 0 until N_DATA) cw[i] = ((number shr (5 * (N_DATA - 1 - i))) and 31).toInt()
+        for (i in 0 until N_DATA) cw[i] = ((mixed shr (5 * (N_DATA - 1 - i))) and 31).toInt()
         val rem = IntArray(N_CHECK)
         for (i in 0 until N_DATA) {
             val f = cw[i] xor rem[0]
@@ -114,8 +165,9 @@ object Spec {
         if (correctOne(cw) < 0) {
             if (doubtful1 < 0 || !fillTwo(cw, doubtful1, doubtful2)) return -1
         }
-        var number = 0L
-        for (i in 0 until N_DATA) number = (number shl 5) or cw[i].toLong()
+        var mixed = 0L
+        for (i in 0 until N_DATA) mixed = (mixed shl 5) or cw[i].toLong()
+        val number = unmix(mixed)
         return if (number < MAX_NUMBER) number else -1
     }
 

@@ -50,12 +50,19 @@ class DecoderTest {
 
     @Test
     fun encodeRoundTrips() {
-        for (n in longArrayOf(0, 1, 42, 123456789012, 555555555555, 999999999999)) {
+        for (n in longArrayOf(0, 1, 42, 123456789012, 555555555555, 999999999999, Spec.MAX_NUMBER - 1)) {
             assertEquals(n, Spec.decodeSymbols(Spec.encode(n)))
         }
+        // Metadata and payload share the 40 bits; a member ID is the payload plus payload mod 97.
+        assertEquals(108, Spec.METADATA_LIMIT - 1)
+        assertEquals(54_320_880_580, Spec.pack(5, 4320880580))
+        assertEquals("432088058060", Spec.memberId(4320880580))
+        assertEquals("000000000707", Spec.memberId(7))
         // Same symbols as the Python and JavaScript encoders.
         val symbols = Spec.encode(123456789012)
-        assertEquals(listOf(22, 24, 12, 21, 27, 0, 14, 21, 25, 27, 14, 27), symbols.toList())
+        assertEquals(listOf(17, 29, 30, 30, 15, 0, 5, 24, 7, 24, 30, 31), symbols.toList())
+        assertEquals(1095871966354, Spec.mix(Spec.pack(5, 4320880580)))
+        assertEquals(Spec.pack(5, 4320880580), Spec.unmix(1095871966354))
         // One damaged star is repaired; two are refused, unless the reader says which two it doubts.
         val one = symbols.clone().also { it[3] = it[3] xor 4 }
         assertEquals(123456789012, Spec.decodeSymbols(one))

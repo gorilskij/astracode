@@ -13,7 +13,14 @@ Layout
   - The logo sits inside a circle of diameter LOGO_D at the centre.
 
 Payload
-  - A number 0 .. 10^12-1, as 8 symbols (40 bits), most significant first.
+  - 40 bits holding metadata * 10^10 + payload: a 10-digit payload (0 ..
+    9 999 999 999) and a metadata value 0 .. 108 saying what the payload is.
+  - That value is scrambled by a fixed, public, reversible mixing step (MIX)
+    so that codes for neighbouring values look unrelated and use both shades
+    evenly. It is not encryption: anyone can undo it.
+  - The scrambled value is stored as 8 symbols, most significant first.
+  - A member ID is 12 digits: 10 digits followed by those 10 digits mod 97.
+    Only the first 10 are stored; the last two are recomputed when reading.
   - 4 Reed-Solomon check symbols over GF(32) follow (stars 8 to 11). They let
     a reader repair one misread star and still detect up to three, or repair
     two stars it already knows to be doubtful.
@@ -36,7 +43,9 @@ SHADE = 0.7                  # ink fraction of a light limb
 N_STARS = 12
 N_DATA = 8
 N_CHECK = N_STARS - N_DATA
-MAX_NUMBER = 10 ** 12
+PAYLOAD_LIMIT = 10 ** 10                      # payloads are 0 .. PAYLOAD_LIMIT - 1
+METADATA_LIMIT = (1 << 40) // PAYLOAD_LIMIT   # 109: metadata is 0 .. 108
+MAX_NUMBER = METADATA_LIMIT * PAYLOAD_LIMIT   # every stored value is below this, and below 2^40
 
 MASK = (0x15, 0x0A, 0x13, 0x1C, 0x09, 0x06, 0x1E, 0x01, 0x17, 0x08, 0x1B, 0x04)
 
@@ -136,19 +145,76 @@ def rs_fill(cw, i1, i2):
     return fixed
 
 
+# ---------------------------------------------------------------- mixing
+
+_MIX_KEYS = (0x3C6EF, 0x1B873, 0x5A827, 0x6ED9E)
+
+
+def _mix_round(x, key):
+    """20 bits -> 20 bits; 32-bit integer arithmetic so every implementation agrees."""
+    t = ((x + key) * 0x9E3779B1) & 0xFFFFFFFF
+    t ^= t >> 15
+    t = (t * 0x85EBCA77) & 0xFFFFFFFF
+    t ^= t >> 13
+    return t & 0xFFFFF
+
+
+def mix(value):
+    """Scramble a 40-bit value: a 4-round Feistel network on its two 20-bit halves."""
+    left, right = value >> 20, value & 0xFFFFF
+    for key in _MIX_KEYS:
+        left, right = right, left ^ _mix_round(right, key)
+    return left << 20 | right
+
+
+def unmix(value):
+    left, right = value >> 20, value & 0xFFFFF
+    for key in reversed(_MIX_KEYS):
+        left, right = right ^ _mix_round(left, key), left
+    return left << 20 | right
+
+
 # ---------------------------------------------------------------- payload
 
+def pack(metadata, payload):
+    """Metadata 0..108 and a 10-digit payload -> the stored value."""
+    if not 0 <= metadata < METADATA_LIMIT:
+        raise ValueError("metadata must be 0..%d" % (METADATA_LIMIT - 1))
+    if not 0 <= payload < PAYLOAD_LIMIT:
+        raise ValueError("payload must have at most 10 digits")
+    return metadata * PAYLOAD_LIMIT + payload
+
+
+def unpack(value):
+    """Stored value -> (metadata, payload)."""
+    return divmod(value, PAYLOAD_LIMIT)
+
+
+def member_id(payload):
+    """The 12-digit member ID for a 10-digit payload: the payload, then payload mod 97."""
+    return "%010d%02d" % (payload, payload % 97)
+
+
+def payload_of_member_id(text):
+    """12-digit member ID -> its 10-digit payload; ValueError if the last two digits are wrong."""
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) != 12 or int(digits[:10]) % 97 != int(digits[10:]):
+        raise ValueError("not a valid member ID")
+    return int(digits[:10])
+
+
 def encode(number):
-    """Number -> the 12 symbols as drawn (masked)."""
+    """Stored value (see pack) -> the 12 symbols as drawn (masked)."""
     if not 0 <= number < MAX_NUMBER:
-        raise ValueError("number must have at most 12 digits")
-    data = [(number >> (5 * (N_DATA - 1 - i))) & 31 for i in range(N_DATA)]
+        raise ValueError("value out of range")
+    mixed = mix(number)
+    data = [(mixed >> (5 * (N_DATA - 1 - i))) & 31 for i in range(N_DATA)]
     cw = data + rs_parity(data)
     return [c ^ m for c, m in zip(cw, MASK)]
 
 
 def decode_symbols(symbols, doubtful=None):
-    """The 12 symbols as drawn -> (number, stars repaired), or None if the check fails.
+    """The 12 symbols as drawn -> (stored value, stars repaired), or None if the check fails.
 
     Repairs one misread star anywhere. If that fails and `doubtful` names two
     stars the reader is unsure of, repairs exactly those two instead.
@@ -161,9 +227,10 @@ def decode_symbols(symbols, doubtful=None):
     if res is None:
         return None
     cw, repaired = res
-    number = 0
+    mixed = 0
     for d in cw[:N_DATA]:
-        number = (number << 5) | d
+        mixed = (mixed << 5) | d
+    number = unmix(mixed)
     return (number, repaired) if number < MAX_NUMBER else None
 
 
@@ -210,7 +277,7 @@ LOGO_PATHS = (
 )
 
 
-def mix(background, ink, t):
+def blend(background, ink, t):
     """Hex colour t of the way from background to ink."""
     a = [int(background[i:i + 2], 16) for i in (1, 3, 5)]
     b = [int(ink[i:i + 2], 16) for i in (1, 3, 5)]
@@ -218,7 +285,7 @@ def mix(background, ink, t):
 
 
 def svg(number, ink="#021639", background="#febc5c", size=512):
-    """The code as an SVG string."""
+    """The code for a stored value (see pack) as an SVG string."""
     poly = lambda pts: '<polygon points="%s"/>' % " ".join("%.3f,%.3f" % p for p in pts)
     light = solid = ""
     for i, sym in enumerate(encode(number)):
@@ -230,6 +297,6 @@ def svg(number, ink="#021639", background="#febc5c", size=512):
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" '
         f'viewBox="{-HALF} {-HALF} {2 * HALF} {2 * HALF}">'
         f'<rect x="{-HALF}" y="{-HALF}" width="{2 * HALF}" height="{2 * HALF}" fill="{background}"/>'
-        f'<g fill="{mix(background, ink, SHADE)}">{light}</g><g fill="{ink}">{solid}'
+        f'<g fill="{blend(background, ink, SHADE)}">{light}</g><g fill="{ink}">{solid}'
         f'<g transform="scale({k}) translate({-LOGO_SRC / 2} {-LOGO_SRC / 2}) {LOGO_TRANSFORM}">'
         f'{LOGO_PATHS}</g></g></svg>')

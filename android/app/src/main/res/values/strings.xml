@@ -7,4 +7,5 @@
     <string name="copy">Copy</string>
     <string name="copied">Copied</string>
     <string name="scan_again">Scan again</string>
+    <string name="result_detail">metadata %1$d · payload %2$010d</string>
 </resources>

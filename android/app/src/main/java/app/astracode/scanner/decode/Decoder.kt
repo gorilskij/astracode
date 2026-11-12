@@ -29,7 +29,12 @@ class Gray(val width: Int, val height: Int, val px: FloatArray) {
 
 /** A decoded code. [corners] is the code square in image pixels: x0, y0, ... clockwise from its top left. */
 class ScanResult(val number: Long, val corners: FloatArray, val confidence: Float, val logoScore: Float) {
+    /** The stored value as text; see [metadata] and [payload] for its two parts. */
     val text: String get() = number.toString().padStart(12, '0')
+    val metadata: Int get() = (number / Spec.PAYLOAD_LIMIT).toInt()
+    val payload: Long get() = number % Spec.PAYLOAD_LIMIT
+    /** The payload followed by its two mod-97 check digits. */
+    val memberId: String get() = Spec.memberId(payload)
 }
 
 /**
