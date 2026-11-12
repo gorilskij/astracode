@@ -18,8 +18,8 @@
   <label><span>12-digit number</span><input type="text" id="num" maxlength="12" value="123456789012"></label>
   <div class="row">
     <button id="rand">Random</button>
-    <button id="full">All limbs</button>
-    <button id="empty">No limbs</button>
+    <button id="full">All solid</button>
+    <button id="empty">All light</button>
   </div>
   <label><span>Star size (outer radius) <b id="vStar"></b></span><input type="range" id="star" min="8" max="26" step="0.5" value="19.5"></label>
   <label><span>Logo crop circle diameter <b id="vLogo"></b></span><input type="range" id="logo" min="80" max="280" step="1" value="180"></label>
@@ -30,7 +30,7 @@
     <button id="swap">Swap</button>
   </div>
   <div id="nibbles"></div>
-  <div style="color:#555">Ring radius is fixed at 100; all sizes are relative to it. The scanner expects the defaults (star 19.5, logo 180); other values are for looking only. Stars are regular pentagrams. Stars 11 and 12 are check symbols.</div>
+  <div style="color:#555">Ring radius is fixed at 100; all sizes are relative to it. The scanner expects the defaults (star 19.5, logo 180); other values are for looking only. Every star is a full pentagram: each limb is solid or 70% ink, the centre is always solid. Stars 9 to 12 are check symbols.</div>
 </div>
 
 <div id="previews">
@@ -47,52 +47,76 @@ const RATIO = Math.sin(Math.PI / 10) / Math.sin(3 * Math.PI / 10); // regular pe
 const $ = id => document.getElementById(id);
 let override = null; // null | 15 | 0
 
-// Star centred at (cx, cy). Top limb always present; bits 3..0 = limbs clockwise from upper right.
-function star(cx, cy, ro, ratio, nibble) {
-  const ri = ro * ratio, pts = [];
-  const p = (r, deg) => {
-    const a = deg * Math.PI / 180;
-    pts.push((cx + r * Math.cos(a)).toFixed(2) + ',' + (cy + r * Math.sin(a)).toFixed(2));
-  };
+const SHADE = 0.7;   // ink fraction of a light limb
+const P = (cx, cy, r, deg) => {
+  const a = deg * Math.PI / 180;
+  return (cx + r * Math.cos(a)).toFixed(3) + ',' + (cy + r * Math.sin(a)).toFixed(3);
+};
+// Bit 4 of a star's symbol is the top limb, then clockwise bits 3..0. 1 = solid, 0 = light.
+const limbSolid = (symbol, k) => (symbol >> (4 - k)) & 1;
+
+// The solid part of a star: centre pentagon plus its solid limbs.
+function solidPart(cx, cy, ro, symbol) {
+  const pts = [];
   for (let k = 0; k < 5; k++) {
-    p(ri, -90 - 36 + 72 * k);
-    if (k === 0 || (nibble >> (4 - k)) & 1) p(ro, -90 + 72 * k);
+    pts.push(P(cx, cy, ro * RATIO, -90 - 36 + 72 * k));
+    if (limbSolid(symbol, k)) pts.push(P(cx, cy, ro, -90 + 72 * k));
   }
   return `<polygon points="${pts.join(' ')}"/>`;
 }
 
-// --- payload encoding; must match astracode/spec.py ---
-const MASK = [0x5, 0xA, 0x3, 0xC, 0x9, 0x6, 0xE, 0x1, 0x7, 0x8, 0xB, 0x4];
-const GF_EXP = [], GF_LOG = [];
-for (let i = 0, x = 1; i < 15; i++) { GF_EXP[i] = GF_EXP[i + 15] = x; GF_LOG[x] = i; x <<= 1; if (x & 16) x ^= 0x13; }
-const gfMul = (a, b) => (a && b) ? GF_EXP[GF_LOG[a] + GF_LOG[b]] : 0;
+// One limb, closed through the star centre so it tucks under the solid centre without a seam.
+function limb(cx, cy, ro, k) {
+  const pts = [P(cx, cy, ro * RATIO, -90 - 36 + 72 * k), P(cx, cy, ro, -90 + 72 * k),
+               P(cx, cy, ro * RATIO, -90 + 36 + 72 * k), P(cx, cy, 0, 0)];
+  return `<polygon points="${pts.join(' ')}"/>`;
+}
 
-// Number -> the 12 symbols as drawn: 10 data symbols, 2 Reed-Solomon check symbols, masked.
+const mix = (bg, ink, t) => '#' + [1, 3, 5].map(i => {
+  const a = parseInt(bg.slice(i, i + 2), 16), b = parseInt(ink.slice(i, i + 2), 16);
+  return Math.round(a + (b - a) * t).toString(16).padStart(2, '0');
+}).join('');
+
+// --- payload encoding; must match astracode/spec.py ---
+const MASK = [0x15, 0x0A, 0x13, 0x1C, 0x09, 0x06, 0x1E, 0x01, 0x17, 0x08, 0x1B, 0x04];
+const GF_EXP = [], GF_LOG = [];
+for (let i = 0, x = 1; i < 31; i++) { GF_EXP[i] = GF_EXP[i + 31] = x; GF_LOG[x] = i; x <<= 1; if (x & 32) x ^= 0x25; }
+const gfMul = (a, b) => (a && b) ? GF_EXP[GF_LOG[a] + GF_LOG[b]] : 0;
+// Generator polynomial with roots a^0..a^3, highest degree first.
+let GEN = [1];
+for (let j = 0; j < 4; j++) GEN = [...GEN, 0].map((x, i) => x ^ gfMul(i ? GEN[i - 1] : 0, GF_EXP[j]));
+
+// Number -> the 12 symbols as drawn: 8 data symbols (5 bits each), 4 Reed-Solomon check symbols, masked.
 function encode(numStr) {
   let n = BigInt(numStr || '0');
   const data = [];
-  for (let i = 0; i < 10; i++) { data.unshift(Number(n & 15n)); n >>= 4n; }
-  let r1 = 0, r0 = 0;
-  for (const d of data) { const f = d ^ r1; r1 = r0 ^ gfMul(f, 3); r0 = gfMul(f, 2); }
-  return [...data, r1, r0].map((c, i) => c ^ MASK[i]);
+  for (let i = 0; i < 8; i++) { data.unshift(Number(n & 31n)); n >>= 5n; }
+  let rem = [0, 0, 0, 0];
+  for (const d of data) {
+    const f = d ^ rem[0];
+    rem = [rem[1], rem[2], rem[3], 0].map((r, i) => r ^ gfMul(f, GEN[i + 1]));
+  }
+  return [...data, ...rem].map((c, i) => c ^ MASK[i]);
 }
 // --- end payload encoding ---
 
 function render() {
-  const ro = +$('star').value, ratio = RATIO, lh = +$('logo').value, pad = +$('pad').value, fg = $('fg').value, bg = $('bg').value;
+  const ro = +$('star').value, lh = +$('logo').value, pad = +$('pad').value, fg = $('fg').value, bg = $('bg').value;
   $('vStar').textContent = ro; $('vLogo').textContent = lh; $('vPad').textContent = pad;
   const num = $('num').value.replace(/\D/g, '');
   const nib = override === null ? encode(num) : Array(12).fill(override);
-  $('nibbles').textContent = 'symbols: ' + nib.map(x => x.toString(16)).join(' ');
+  $('nibbles').textContent = 'symbols: ' + nib.map(x => x.toString(32)).join(' ');
 
-  let stars = '';
+  let stars = '', light = '';
   for (let i = 0; i < 12; i++) {
-    const a = (-90 + 30 * i) * Math.PI / 180;
-    stars += star(R * Math.cos(a), R * Math.sin(a), ro, ratio, nib[i]);
+    const a = (-90 + 30 * i) * Math.PI / 180, cx = R * Math.cos(a), cy = R * Math.sin(a);
+    for (let k = 0; k < 5; k++) if (!limbSolid(nib[i], k)) light += limb(cx, cy, ro, k);
+    stars += solidPart(cx, cy, ro, nib[i]);
   }
   const half = R + ro + pad, k = lh / LOGO_SRC;
   const svg = size => `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="${-half} ${-half} ${2 * half} ${2 * half}">
     <rect x="${-half}" y="${-half}" width="${2 * half}" height="${2 * half}" fill="${bg}"/>
+    <g fill="${mix(bg, fg, SHADE)}">${light}</g>
     <g fill="${fg}">${stars}
       <g transform="scale(${k}) translate(${-LOGO_SRC / 2} ${-LOGO_SRC / 2}) ${LOGO_TF}">${LOGO}</g>
     </g></svg>`;
@@ -102,7 +126,7 @@ function render() {
 
 for (const el of document.querySelectorAll('input')) el.addEventListener('input', () => { if (el.id === 'num') override = null; render(); });
 $('rand').onclick = () => { override = null; $('num').value = String(Math.floor(Math.random() * 1e12)).padStart(12, '0'); render(); };
-$('full').onclick = () => { override = 15; render(); };
+$('full').onclick = () => { override = 31; render(); };
 $('empty').onclick = () => { override = 0; render(); };
 $('swap').onclick = () => { const t = $('fg').value; $('fg').value = $('bg').value; $('bg').value = t; render(); };
 render();

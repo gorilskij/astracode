@@ -140,6 +140,12 @@ def make_case(seed, level=1.0):
         rad = rng.uniform(40, 200)
         img += (rng.uniform(40, 120) * np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * rad * rad)))[..., None]
 
+    # Camera tone curve: a random gamma, which moves the light shade relative to solid and background.
+    gamma = 1.0
+    if rng.random() < 0.6:
+        gamma = float(np.exp(rng.uniform(math.log(0.6), math.log(1.7))))
+        img = 255.0 * (np.clip(img, 0, 255) / 255.0) ** gamma
+
     # Blur, expressed in model units so it is equally severe at any code size.
     blur_units = 0.0
     if rng.random() < 0.7:
@@ -162,7 +168,7 @@ def make_case(seed, level=1.0):
     q = int(rng.uniform(100 - 65 * min(level, 1.0), 95))
     img = cv2.imdecode(cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, q])[1], cv2.IMREAD_COLOR)
     meta = dict(seed=seed, number=number, diameter=diameter, tilt=tilt, blur=blur_units, motion=motion_units,
-                noise=noise, jpeg=q, contrast=abs(luma(ink) - luma(bgc)), H=H)
+                noise=noise, jpeg=q, gamma=gamma, contrast=abs(luma(ink) - luma(bgc)), H=H)
     return img, meta
 
 
@@ -181,6 +187,7 @@ def run_case(args):
         meta["result"] = "miss"
     elif len(found) == 1 and found[0]["number"] == meta["number"]:
         meta["result"] = "ok"
+        meta["repaired"] = found[0]["repaired"]
     else:
         meta["result"] = "wrong"
     return meta
@@ -213,13 +220,15 @@ def main():
         neg = pool.map(run_negative, range(10 ** 6, 10 ** 6 + count // 2), chunksize=8)
     ok = sum(r["result"] == "ok" for r in rows)
     wrong = [r for r in rows if r["result"] == "wrong"]
-    print(f"decoded {ok}/{count} ({100 * ok / count:.1f}%), wrong number {len(wrong)}")
+    print(f"decoded {ok}/{count} ({100 * ok / count:.1f}%), wrong number {len(wrong)}, "
+          f"needed a star repaired {sum(r.get('repaired', 0) for r in rows)}")
     print(f"false positives on {len(neg)} code-free frames: {sum(n > 0 for n in neg)}")
     table(rows, "diameter", [90, 130, 180, 250, 350, 560], "code width in px")
     table(rows, "tilt", [0, 15, 30, 45, 55], "tilt in degrees")
     table(rows, "blur", [0, 0.01, 0.7, 1.4, 2.2, 9], "blur sigma, model units")
     table(rows, "motion", [0, 0.01, 3, 6, 99], "motion blur length, model units")
     table(rows, "contrast", [50, 80, 120, 256], "ink/background luma difference")
+    table(rows, "gamma", [0.6, 0.8, 0.999, 1.001, 1.3, 1.71], "camera gamma")
     fails = [r for r in rows if r["result"] != "ok"]
     print("\n  wrong seeds:", [r["seed"] for r in wrong])
     print("  missed seeds:", [r["seed"] for r in fails if r["result"] == "miss"][:60])

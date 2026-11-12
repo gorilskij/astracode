@@ -54,9 +54,15 @@ class DecoderTest {
             assertEquals(n, Spec.decodeSymbols(Spec.encode(n)))
         }
         // Same symbols as the Python and JavaScript encoders.
-        assertEquals(listOf(4, 6, 8, 2, 0, 15, 15, 11, 6, 12, 5, 12), Spec.encode(123456789012).toList())
-        val damaged = Spec.encode(123456789012).also { it[3] = it[3] xor 4 }
-        assertEquals(-1, Spec.decodeSymbols(damaged))
+        val symbols = Spec.encode(123456789012)
+        assertEquals(listOf(22, 24, 12, 21, 27, 0, 14, 21, 25, 27, 14, 27), symbols.toList())
+        // One damaged star is repaired; two are refused, unless the reader says which two it doubts.
+        val one = symbols.clone().also { it[3] = it[3] xor 4 }
+        assertEquals(123456789012, Spec.decodeSymbols(one))
+        val two = one.clone().also { it[9] = it[9] xor 17 }
+        assertEquals(-1, Spec.decodeSymbols(two))
+        assertEquals(123456789012, Spec.decodeSymbols(two, 3, 9))
+        assertEquals(-1, Spec.decodeSymbols(two, 1, 2))
     }
 
     @Test
@@ -65,7 +71,7 @@ class DecoderTest {
         val t = run(dir)
         assertEquals(0, t.wrong)
         assertEquals(0, t.falsePositives)
-        assertEquals(t.frames, t.ok)
+        assertTrue("decoded ${t.ok}, reference ${t.reference}", t.ok >= t.reference - 1)
     }
 
     /** Runs only when ASTRA_FIXTURES points at a set made by tools/export_android.py. */

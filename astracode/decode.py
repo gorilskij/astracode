@@ -1,4 +1,4 @@
-"""Astracode scanner.
+"""Astracode scanner (format version 2).
 
 Pipeline (the same shape as a QR reader):
   1. Binarise with a local-mean threshold, in both polarities.
@@ -7,17 +7,16 @@ Pipeline (the same shape as a QR reader):
      must be and step round until the ring closes after 12 (a few may be missing).
   4. Homography from the ring slots to the blob centres.
   5. Resolve which of the 12 ring rotations is "up" by correlating the fixed
-     pattern (star cores, top limbs, the gaps between limbs, the logo).
-  6. Refine: each star's core + top limb act as an alignment pattern; re-locate
-     every star against the grey image and refit the homography. Repeat with
-     the full shape of each star once its symbol has been read.
-  7. Sample the four data limbs of each star, normalised by that star's own
-     background and top limb, and threshold.
-  8. Check with Reed-Solomon. No error correction: with only two check stars,
-     "fixing" a read is how wrong numbers get through, and the next camera frame
-     is a better second opinion.
+     pattern: the logo, and the stars themselves (every star is a complete
+     upright pentagram, whatever its data).
+  6. Refine: re-locate every star against the grey image by template match and
+     refit the homography.
+  7. Sample the five limbs of each star against the background beside them and
+     that star's solid centre. Split all 60 limbs of the code into a light and
+     a solid group, which calibrates the two shades for this photo.
+  8. Reed-Solomon: repair at most one star, refuse if more look wrong.
 
-Only step 1-3 use the binary image; everything after samples grey levels.
+Only steps 1-3 use the binary image; everything after samples grey levels.
 """
 import math
 import sys
@@ -72,33 +71,25 @@ def _build_fixed_pattern():
     xy = np.array([(x, y) for x in g for y in g if x * x + y * y <= 70 * 70], np.float32)
     px = np.clip(np.round((xy + spec.LOGO_D / 2) * ppu).astype(int), 0, la.shape[0] - 1)
     logo_t = la[px[:, 1], px[:, 0]]
-    star = np.concatenate([_CORE, _LIMB[0], _GAP.reshape(-1, 2)])
-    star_t = np.concatenate([np.ones(_NC + _NL), np.zeros(5 * _NG)]).astype(np.float32)
+    star = np.concatenate([_CORE, _LIMB.reshape(-1, 2), _GAP.reshape(-1, 2)])
+    star_t = np.concatenate([np.ones(_NC + 5 * _NL), np.zeros(5 * _NG)]).astype(np.float32)
     sxy = (_CENTERS[:, None, :] + star[None]).reshape(-1, 2)
     return (xy, logo_t), (sxy, np.tile(star_t, 12))
 
 
 (_LOGO_XY, _LOGO_T), (_FIX_XY, _FIX_T) = _build_fixed_pattern()
 
-# Dense star template for alignment: a grid over the star's disc, with a weight per
-# grid point for each of the 16 shapes (+ inside, - outside), plus a shape-agnostic
-# variant (index 16) that only uses what every star shares: core and top limb are ink,
-# the wedges between limb positions are background, the four data limbs are ignored.
+# Dense star template for alignment: a grid over the star's disc, weighted + inside
+# the pentagram and - outside it. Every star has the same outline in this format.
 _SEARCH = np.array([(dx, dy) for dx in np.arange(-4, 4.1, 1.0) for dy in np.arange(-4, 4.1, 1.0)], np.float32)
 _GRID = np.array([(x, y) for x in np.arange(-21, 21.1, 1.5) for y in np.arange(-21, 21.1, 1.5)
                   if x * x + y * y <= 22 * 22], np.float32)
 
 
 def _build_align_weights():
-    def inside(sym):
-        poly = np.array(spec.star_polygon(sym), np.float32)
-        return np.array([cv2.pointPolygonTest(poly, (float(x), float(y)), False) >= 0 for x, y in _GRID])
-    def weights(ink, bg):
-        return np.where(ink, 1.0 / ink.sum(), 0) - np.where(bg, 1.0 / bg.sum(), 0)
-    full, bare = inside(15), inside(0)
-    w = [weights(inside(sym), ~inside(sym)) for sym in range(16)]
-    w.append(weights(bare, ~full))
-    return np.array(w, np.float32)
+    poly = np.array(spec.star_polygon(31), np.float32)
+    ink = np.array([cv2.pointPolygonTest(poly, (float(x), float(y)), False) >= 0 for x, y in _GRID])
+    return (np.where(ink, 1.0 / ink.sum(), 0) - np.where(~ink, 1.0 / (~ink).sum(), 0)).astype(np.float32)
 
 
 _ALIGN_W = _build_align_weights()
@@ -309,7 +300,7 @@ def _rot(k):
 
 
 def _orient(gray, H0, pol):
-    """Pick which of the 12 ring rotations puts the top limbs on top. Returns (H, star score, logo score)."""
+    """Pick which of the 12 ring rotations is upright. Returns (H, star score, logo score)."""
     best = None
     for k in range(12):
         H = H0 @ _rot(k)
@@ -320,15 +311,11 @@ def _orient(gray, H0, pol):
     return best[1], best[2], best[3]
 
 
-def _refine(gray, H, pol, shapes):
-    """Re-locate every star by template match, then refit the homography.
-
-    shapes: the 12 symbols read so far, or None to use only the core and top limb.
-    """
+def _refine(gray, H, pol):
+    """Re-locate every star by template match, then refit the homography."""
     pts = (_CENTERS[:, None, None, :] + _SEARCH[None, :, None, :] + _GRID[None, None, :, :])
     v = _sample(gray, _apply(H, pts.reshape(-1, 2))).reshape(12, len(_SEARCH), -1)
-    w = _ALIGN_W[[16] * 12 if shapes is None else shapes]
-    score = -pol * (v * w[:, None, :]).sum(2)
+    score = -pol * (v * _ALIGN_W).sum(2)
     best = score.argmax(1)
     found = np.empty((12, 2))
     for i in range(12):
@@ -338,38 +325,110 @@ def _refine(gray, H, pol, shapes):
     return _homography(_CENTERS, _apply(H, found))
 
 
-def _symbols(bits):
-    return [int(r[0]) << 3 | int(r[1]) << 2 | int(r[2]) << 1 | int(r[3]) for r in bits]
+def _limb_strength(core, limb, gap, pol):
+    """How inked each limb is, on a scale where 0 is background and about 1 is solid.
 
-
-def _bits(core, limb, gap, pol):
-    """Limb presence per star and data limb, its confidence 0..1, and the top-limb strength.
-
-    Each limb is compared with the background on its own two sides, as a ratio,
-    so a shadow edge or light gradient across a star cancels out. The star's top
-    limb, which is always present, sets the scale for "present".
+    Each limb is compared with the background on its own two sides, so a shadow
+    edge or light gradient across a star cancels out; the star's always-solid
+    centre sets the scale.
     """
     eps = 8.0
     flank = 0.5 * (gap + np.roll(gap, 1, axis=1))
-    q = pol * np.log((flank + eps) / (limb + eps))        # > 0 where the limb is inked
-    top = np.maximum(q[:, 0], 1e-3)
-    n = q[:, 1:] / top[:, None]
-    q_core = pol * np.log((np.median(gap, 1) + eps) / (core + eps))
-    return n > 0.5, np.clip(np.abs(n - 0.5) * 2, 0, 1), q[:, 0] / np.maximum(q_core, 1e-3)
+    bg = np.median(gap, 1)
+    # Contrast of the limb against its flanks, relative to the core's contrast, with
+    # the local light level (flank vs the star's typical background) divided out.
+    num = pol * (flank - limb) / (flank + eps)
+    den = pol * (bg - core) / (bg + eps)
+    return num / np.maximum(den, 1e-3)[:, None]
 
 
-# The two check stars catch every error confined to one or two stars, so a wrong
-# number needs three or more stars misread at once. Refuse to answer when that
-# many stars have a limb too close to the threshold to call.
-WEAK_CONFIDENCE = 0.15
-MAX_WEAK_STARS = 2
+def _two_groups(v):
+    """Split values into a low and a high group (1-D 2-means). Returns (low centre, high centre)."""
+    lo, hi = np.percentile(v, 10), np.percentile(v, 90)
+    for _ in range(20):
+        high = v > 0.5 * (lo + hi)
+        if high.all() or not high.any():
+            break
+        new_lo, new_hi = v[~high].mean(), v[high].mean()
+        if abs(new_lo - lo) + abs(new_hi - hi) < 1e-5:
+            break
+        lo, hi = new_lo, new_hi
+    return float(lo), float(hi)
+
+
+# Design matrix for the limb model:
+#   log strength = a[limb direction] + plane(star position) + d[star] + light * log(ratio)
+# Columns: 5 directions, 2 plane slopes, 12 per-star offsets, 1 light flag.
+_MODEL_A = np.zeros((60, 20))
+for _i in range(12):
+    for _k in range(5):
+        _MODEL_A[_i * 5 + _k, _k] = 1
+        _MODEL_A[_i * 5 + _k, 5] = _CENTERS[_i, 0] / spec.R
+        _MODEL_A[_i * 5 + _k, 6] = _CENTERS[_i, 1] / spec.R
+        _MODEL_A[_i * 5 + _k, 7 + _i] = 1
+del _i, _k
+# Ridge rows that pull the per-star offsets towards zero. A star's own five limbs
+# easily outweigh this, so a star dimmed by glare or shadow gets its own level; but
+# for a star whose limbs are all one shade, it is what says "that shade, at the usual
+# level" rather than "the other shade, at an unusual level".
+_STAR_RIDGE = 4.0
+_MODEL_PENALTY = np.zeros((12, 20))
+_MODEL_PENALTY[np.arange(12), 7 + np.arange(12)] = math.sqrt(_STAR_RIDGE)
+
+
+def _classify(strength):
+    """Decide light or solid for all 60 limbs. Returns (solid mask 12x5, confidence 12x5, ratio, separation).
+
+    Blur, motion and lighting weaken limbs unevenly: by limb direction (motion
+    blur), smoothly across the code (perspective, focus), and star by star
+    (glare, reflections). So rather than one threshold, fit a model with those
+    three effects plus the light/solid ratio, alternating with the assignment.
+    """
+    flat = strength.ravel()
+    # A limb washed out by glare or covered reads as hardly inked at all. Leave such
+    # limbs out of the fit and report them with zero confidence.
+    usable = flat > 0.3 * np.median(flat)
+    v = np.log(np.maximum(flat, 1e-3))
+    lo, hi = _two_groups(v[usable])
+    light = v < 0.5 * (lo + hi)
+    A = _MODEL_A.copy()
+    zeros = np.zeros(12)
+    for _ in range(10):
+        A[:, 19] = light
+        coef = np.linalg.lstsq(np.vstack([A[usable], _MODEL_PENALTY]), np.concatenate([v[usable], zeros]), rcond=None)[0]
+        log_ratio = min(coef[19], -0.05)
+        resid = v - A[:, :19] @ coef[:19]
+        new = resid < 0.5 * log_ratio
+        if (new == light).all():
+            break
+        light = new
+    light = resid < 0.5 * log_ratio
+    conf = np.clip(np.abs(resid - 0.5 * log_ratio) / (0.5 * abs(log_ratio)), 0, 1)
+    conf[~usable] = 0
+    err = np.where(light, resid - log_ratio, resid)[usable]
+    separation = abs(log_ratio) / (err.std() + 1e-6)
+    return (~light).reshape(12, 5), conf.reshape(12, 5), float(np.exp(log_ratio)), float(separation)
+
+
+def _symbols(bits):
+    return [int(r[0]) << 4 | int(r[1]) << 3 | int(r[2]) << 2 | int(r[3]) << 1 | int(r[4]) for r in bits]
+
+
+# The check stars repair one misread star anywhere, or else the two least certain
+# stars. Refuse to answer when too many stars have a limb close to the light/solid
+# threshold, or when the two shades are not clearly apart: that is when several
+# stars can be wrong at once and a repair would be a guess.
+WEAK_CONFIDENCE = 0.25      # distance from the threshold, as a fraction of half the gap between shades
+MAX_WEAK_STARS = 3
+CLEAR_CONFIDENCE = 0.4      # what every other star must reach before two stars may be rebuilt
+MIN_SHADE_SEPARATION = 4.0  # gap between the two shades, in units of their spread
 
 
 def _read_candidate(gray, centres, slots, pol, debug=None):
     ang = np.radians(30.0 * slots)
     model = np.stack([spec.R * np.cos(ang), spec.R * np.sin(ang)], 1)
     H0 = _homography(model, centres)
-    # Blob centres sit within a few units of the star centres; a worse fit is not a ring.
+    # Blob centres sit on the star centres; a poor fit is not a ring.
     back = _apply(np.linalg.inv(H0), centres)
     if np.sqrt(((back - model) ** 2).sum(1)).max() > 9:
         return None
@@ -378,30 +437,34 @@ def _read_candidate(gray, centres, slots, pol, debug=None):
         debug.append(dict(stage="orient", star_score=star_score, logo_score=logo_score))
     if star_score < 0.3 or logo_score < 0.2:
         return None
-    H = _refine(gray, H, pol, None)
-    for _ in range(2):
-        bits = _bits(*_read_stars(gray, H), pol)[0]
-        H = _refine(gray, H, pol, _symbols(bits))
+    for _ in range(3):
+        H = _refine(gray, H, pol)
     core, limb, gap = _read_stars(gray, H)
-    bits, conf, top = _bits(core, limb, gap, pol)
+    strength = _limb_strength(core, limb, gap, pol)
     contrast = -pol * (core - np.median(gap, 1))
     logo_score = -pol * _ncc(_sample(gray, _apply(H, _LOGO_XY)), _LOGO_T)
-    info = dict(stage="read", H=H, star_score=star_score, logo_score=logo_score, top_min=float(top.min()),
-                contrast_min=float(contrast.min()), conf_min=float(conf.min()))
+    bits, conf, ratio, separation = _classify(strength)
+    info = dict(stage="read", H=H, star_score=star_score, logo_score=logo_score, limb_min=float(strength.min()),
+                contrast_min=float(contrast.min()), conf_min=float(conf.min()), ratio=ratio,
+                separation=separation, strength=strength, bits=bits)
     if debug is not None:
         debug.append(info)
-    if logo_score < 0.45 or top.min() < 0.3 or contrast.min() < 6:
+    if logo_score < 0.45 or contrast.min() < 6 or not 0.3 < ratio < 0.97:
         return None
-    if (conf.min(1) < WEAK_CONFIDENCE).sum() > MAX_WEAK_STARS:
+    if separation < MIN_SHADE_SEPARATION or (conf.min(1) < WEAK_CONFIDENCE).sum() > MAX_WEAK_STARS:
         return None
-    number = spec.decode_symbols(_symbols(bits))
-    if number is None:
+    # Rebuilding the two least certain stars is only safe when every other star is clear.
+    order = np.argsort(conf.min(1))
+    doubtful = (int(order[0]), int(order[1])) if conf[order[2]].min() >= CLEAR_CONFIDENCE else None
+    decoded = spec.decode_symbols(_symbols(bits), doubtful=doubtful)
+    if decoded is None:
         return None
+    number, repaired = decoded
     outline = _apply(H, np.array([[-spec.HALF, -spec.HALF], [spec.HALF, -spec.HALF],
                                   [spec.HALF, spec.HALF], [-spec.HALF, spec.HALF]]))
-    return dict(number=number, text="%012d" % number, corners=outline,
-                confidence=float(conf.min()), logo_score=logo_score,
-                bit_confidence=conf, top_limb=float(top.min()))
+    return dict(number=number, text="%012d" % number, corners=outline, repaired=repaired,
+                confidence=float(conf.min()), logo_score=logo_score, separation=separation,
+                ratio=ratio, bit_confidence=conf)
 
 
 def scan_gray(gray, debug=None):

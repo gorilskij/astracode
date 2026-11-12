@@ -33,9 +33,10 @@ class ScanResult(val number: Long, val corners: FloatArray, val confidence: Floa
 }
 
 /**
- * Astracode scanner; a port of astracode/decode.py, which documents the pipeline:
- * local threshold -> blobs -> walk the ring of 12 stars -> homography -> find "up"
- * from the fixed pattern -> refine against the grey image -> read limbs -> check.
+ * Astracode scanner (format version 2); a port of astracode/decode.py, which documents
+ * the pipeline: local threshold -> blobs -> walk the ring of 12 stars -> homography ->
+ * find "up" from the logo and star shapes -> refine against the grey image -> read
+ * each limb as light or solid -> Reed-Solomon check and repair.
  */
 object Decoder {
     // ---------------------------------------------------------------- sample patterns
@@ -87,9 +88,9 @@ object Decoder {
     private val STAR_N = STAR_PTS.size / 2
     private val ALL_STAR_PTS = offsetToStars(STAR_PTS)
 
-    /** Points whose ink value is the same in every code: star cores, top limbs and gaps. */
-    private val FIX_XY = offsetToStars(CORE + LIMB[0] + GAP.reduce { a, b -> a + b })
-    private val FIX_T = FloatArray(FIX_XY.size / 2) { if (it % (NC + NL + 5 * NG) < NC + NL) 1f else 0f }
+    /** Points that are ink or background in every code: all of each star is ink, the gaps between limbs are not. */
+    private val FIX_XY = ALL_STAR_PTS
+    private val FIX_T = FloatArray(FIX_XY.size / 2) { if (it % STAR_N < NC + 5 * NL) 1f else 0f }
     private val LOGO_XY = DoubleArray(LogoTemplate.X.size * 2) {
         (if (it % 2 == 0) LogoTemplate.X[it / 2] else LogoTemplate.Y[it / 2]).toDouble()
     }
@@ -100,10 +101,8 @@ object Decoder {
         return out
     }
 
-    // Dense star template for alignment: a grid over the star's disc, with a weight per
-    // grid point for each of the 16 shapes (+ inside, - outside), plus a shape-agnostic
-    // variant (index 16): core and top limb are ink, the wedges between limb positions
-    // are background, the four data limbs are ignored.
+    // Dense star template for alignment: a grid over the star's disc, weighted + inside
+    // the pentagram and - outside it. Every star has the same outline in this format.
     private val SEARCH: DoubleArray = run {
         val out = ArrayList<Double>()
         for (dx in -4..4) for (dy in -4..4) { out += dx.toDouble(); out += dy.toDouble() }
@@ -120,22 +119,12 @@ object Decoder {
         out.toDoubleArray()
     }
     private val NGRID = GRID.size / 2
-    private val ALIGN_W: Array<FloatArray> = run {
-        fun inside(sym: Int): BooleanArray {
-            val poly = Spec.starPolygon(sym)
-            return BooleanArray(NGRID) { pointInPolygon(poly, GRID[2 * it], GRID[2 * it + 1]) }
-        }
-        fun weights(ink: BooleanArray, bg: BooleanArray): FloatArray {
-            val ni = ink.count { it }
-            val nb = bg.count { it }
-            return FloatArray(NGRID) { (if (ink[it]) 1f / ni else 0f) - (if (bg[it]) 1f / nb else 0f) }
-        }
-        val full = inside(15)
-        val bare = inside(0)
-        Array(17) { sym ->
-            if (sym < 16) inside(sym).let { ins -> weights(ins, BooleanArray(NGRID) { !ins[it] }) }
-            else weights(bare, BooleanArray(NGRID) { !full[it] })
-        }
+    private val ALIGN_W: FloatArray = run {
+        val poly = Spec.starPolygon(31)
+        val ink = BooleanArray(NGRID) { pointInPolygon(poly, GRID[2 * it], GRID[2 * it + 1]) }
+        val ni = ink.count { it }
+        val no = NGRID - ni
+        FloatArray(NGRID) { if (ink[it]) 1f / ni else -1f / no }
     }
 
     private fun pointInPolygon(poly: DoubleArray, x: Double, y: Double): Boolean {
@@ -588,18 +577,17 @@ object Decoder {
     private val starBuf = FloatArray(12 * STAR_N)
     private val gridBuf = FloatArray(NGRID)
 
-    /** Re-locate every star by template match and refit the homography. shapes == null: core + top limb only. */
-    private fun refine(g: Gray, h: DoubleArray, pol: Int, shapes: IntArray?): DoubleArray? {
+    /** Re-locate every star by template match and refit the homography. */
+    private fun refine(g: Gray, h: DoubleArray, pol: Int): DoubleArray? {
         val found = DoubleArray(24)
         val score = DoubleArray(NS)
         val centre = DoubleArray(2)
         for (i in 0 until 12) {
-            val w = ALIGN_W[shapes?.get(i) ?: 16]
             var best = 0
             for (o in 0 until NS) {
                 sample(g, h, GRID, gridBuf, CENTERS[2 * i] + SEARCH[2 * o], CENTERS[2 * i + 1] + SEARCH[2 * o + 1])
                 var sc = 0.0
-                for (k in 0 until NGRID) sc += gridBuf[k] * w[k]
+                for (k in 0 until NGRID) sc += gridBuf[k] * ALIGN_W[k]
                 score[o] = -pol * sc
                 if (score[o] > score[best]) best = o
             }
@@ -626,22 +614,19 @@ object Decoder {
         return homography(CENTERS, found)
     }
 
-    private class Read(val symbols: IntArray, val conf: Array<FloatArray>, val top: FloatArray, val contrast: FloatArray)
-
     /**
-     * Sample every star. Each limb is compared with the background on its own two
-     * sides, as a ratio, so a shadow edge or light gradient across a star cancels;
-     * the star's top limb, which is always present, sets the scale for "present".
+     * How inked each of the 60 limbs is (index star * 5 + limb): 0 is background, about 1
+     * is solid. Each limb is compared with the background on its own two sides, so a
+     * shadow edge or light gradient across a star cancels; the star's always-solid
+     * centre sets the scale. Also returns the lowest core contrast in [minContrast].
      */
-    private fun readStars(g: Gray, h: DoubleArray, pol: Int): Read {
+    private fun limbStrength(g: Gray, h: DoubleArray, pol: Int, minContrast: FloatArray): DoubleArray {
         sample(g, h, ALL_STAR_PTS, starBuf)
-        val symbols = IntArray(12)
-        val conf = Array(12) { FloatArray(4) }
-        val top = FloatArray(12)
-        val contrast = FloatArray(12)
+        val out = DoubleArray(60)
         val limb = DoubleArray(5)
         val gap = DoubleArray(5)
         val eps = 8.0
+        minContrast[0] = Float.MAX_VALUE
         for (i in 0 until 12) {
             val o = i * STAR_N
             var core = 0.0
@@ -656,27 +641,118 @@ object Decoder {
                 gap[j] = c / NG
             }
             val bg = gap.sorted()[2]
-            val q = DoubleArray(5) { j -> pol * ln((0.5 * (gap[j] + gap[(j + 4) % 5]) + eps) / (limb[j] + eps)) }
-            val topQ = max(q[0], 1e-3)
-            var sym = 0
-            for (j in 1..4) {
-                val nrm = q[j] / topQ
-                if (nrm > 0.5) sym = sym or (1 shl (4 - j))
-                conf[i][j - 1] = (abs(nrm - 0.5) * 2).coerceIn(0.0, 1.0).toFloat()
+            val den = max(pol * (bg - core) / (bg + eps), 1e-3)
+            for (j in 0 until 5) {
+                val flank = 0.5 * (gap[j] + gap[(j + 4) % 5])
+                out[i * 5 + j] = pol * (flank - limb[j]) / (flank + eps) / den
             }
-            symbols[i] = sym
-            top[i] = (q[0] / max(pol * ln((bg + eps) / (core + eps)), 1e-3)).toFloat()
-            contrast[i] = (-pol * (core - bg)).toFloat()
+            minContrast[0] = min(minContrast[0], (-pol * (core - bg)).toFloat())
         }
-        return Read(symbols, conf, top, contrast)
+        return out
     }
 
-    // The two check stars catch every error confined to one or two stars, so a wrong
-    // number needs three or more stars misread at once. Refuse to answer when that many
-    // stars have a limb too close to the threshold to call. There is deliberately no
-    // error correction: the next camera frame is a better second opinion.
-    private const val WEAK_CONFIDENCE = 0.15f
-    private const val MAX_WEAK_STARS = 2
+    private fun percentile(sorted: DoubleArray, p: Double): Double {
+        val pos = p / 100 * (sorted.size - 1)
+        val i = pos.toInt().coerceAtMost(sorted.size - 2).coerceAtLeast(0)
+        return if (sorted.size == 1) sorted[0] else sorted[i] + (sorted[i + 1] - sorted[i]) * (pos - i)
+    }
+
+    private class Limbs(val solid: BooleanArray, val conf: DoubleArray, val ratio: Double, val separation: Double)
+
+    private const val STAR_RIDGE = 4.0
+
+    /**
+     * Decide light or solid for all 60 limbs. Blur, motion and lighting weaken limbs
+     * unevenly: by limb direction (motion blur), smoothly across the code (perspective,
+     * focus), and star by star (glare, reflections). So rather than one threshold, fit
+     *   log strength = a[limb direction] + plane(star position) + d[star] + light * log(ratio)
+     * alternating with the light/solid assignment. The per-star offsets d are pulled
+     * towards zero, which is what decides a star whose limbs are all one shade.
+     */
+    private fun classify(strength: DoubleArray): Limbs? {
+        val med = strength.sorted().let { 0.5 * (it[29] + it[30]) }
+        // A limb washed out by glare or covered reads as hardly inked: leave it out of the fit.
+        val usable = BooleanArray(60) { strength[it] > 0.3 * med }
+        val v = DoubleArray(60) { ln(max(strength[it], 1e-3)) }
+        val vs = (0 until 60).filter { usable[it] }.map { v[it] }.sorted().toDoubleArray()
+        if (vs.size < 30) return null
+        var lo = percentile(vs, 10.0)
+        var hi = percentile(vs, 90.0)
+        for (iter in 0 until 20) {                  // 1-D 2-means
+            val thr = 0.5 * (lo + hi)
+            var sl = 0.0; var nl = 0; var sh = 0.0; var nh = 0
+            for (x in vs) if (x > thr) { sh += x; nh++ } else { sl += x; nl++ }
+            if (nl == 0 || nh == 0) break
+            val nlo = sl / nl
+            val nhi = sh / nh
+            val done = abs(nlo - lo) + abs(nhi - hi) < 1e-5
+            lo = nlo; hi = nhi
+            if (done) break
+        }
+        val light = BooleanArray(60) { v[it] < 0.5 * (lo + hi) }
+        // Columns: 5 limb directions, 2 plane slopes, 12 star offsets, 1 light flag.
+        val n = 20
+        val row = DoubleArray(n)
+        val resid = DoubleArray(60)
+        var logRatio = -0.05
+        for (iter in 0 until 10) {
+            val ata = Array(n) { DoubleArray(n) }
+            val atb = DoubleArray(n)
+            for (r in 0 until 60) {
+                if (!usable[r]) continue
+                fillRow(row, r, light[r])
+                for (a in 0 until n) {
+                    if (row[a] == 0.0) continue
+                    for (b in 0 until n) ata[a][b] += row[a] * row[b]
+                    atb[a] += row[a] * v[r]
+                }
+            }
+            for (i in 0 until 12) ata[7 + i][7 + i] += STAR_RIDGE
+            for (a in 0 until n) ata[a][a] += 1e-9
+            if (!solve(ata, atb)) return null
+            logRatio = min(atb[19], -0.05)
+            var changed = false
+            for (r in 0 until 60) {
+                fillRow(row, r, false)
+                var fit = 0.0
+                for (a in 0 until 19) fit += row[a] * atb[a]
+                resid[r] = v[r] - fit
+                val nowLight = resid[r] < 0.5 * logRatio
+                if (nowLight != light[r]) { light[r] = nowLight; changed = true }
+            }
+            if (!changed) break
+        }
+        val conf = DoubleArray(60) {
+            if (usable[it]) (abs(resid[it] - 0.5 * logRatio) / (0.5 * abs(logRatio))).coerceIn(0.0, 1.0) else 0.0
+        }
+        var se = 0.0; var se2 = 0.0; var ne = 0
+        for (r in 0 until 60) {
+            if (!usable[r]) continue
+            val e = if (light[r]) resid[r] - logRatio else resid[r]
+            se += e; se2 += e * e; ne++
+        }
+        val sd = sqrt(max(se2 / ne - (se / ne) * (se / ne), 0.0))
+        return Limbs(BooleanArray(60) { !light[it] }, conf, exp(logRatio), abs(logRatio) / (sd + 1e-6))
+    }
+
+    private fun fillRow(row: DoubleArray, r: Int, light: Boolean) {
+        row.fill(0.0)
+        val star = r / 5
+        row[r % 5] = 1.0
+        row[5] = CENTERS[2 * star] / Spec.R
+        row[6] = CENTERS[2 * star + 1] / Spec.R
+        row[7 + star] = 1.0
+        if (light) row[19] = 1.0
+    }
+
+    // The check stars repair one misread star anywhere, or else the two least certain
+    // stars. Refuse to answer when too many stars have a limb close to the light/solid
+    // threshold, or when the two shades are not clearly apart: that is when several
+    // stars can be wrong at once and a repair would be a guess.
+    private const val WEAK_CONFIDENCE = 0.25
+    private const val MAX_WEAK_STARS = 3
+    private const val CLEAR_CONFIDENCE = 0.4
+    private const val MIN_SHADE_SEPARATION = 4.0
 
     private fun readCandidate(g: Gray, b: Blobs, ring: Ring, scale: Double, pol: Int): ScanResult? {
         val n = ring.blobs.size
@@ -690,14 +766,14 @@ object Decoder {
             centres[2 * i + 1] = b.y[ring.blobs[i]] / scale
         }
         val h0 = homography(model, centres) ?: return null
-        // Blob centres sit within a few units of the star centres; a worse fit is not a ring.
+        // Blob centres sit on the star centres; a poor fit is not a ring.
         val inv = inv3(h0)
         val back = DoubleArray(2)
         for (i in 0 until n) {
             applyH(inv, centres[2 * i], centres[2 * i + 1], back, 0)
             if (!(hypot(back[0] - model[2 * i], back[1] - model[2 * i + 1]) <= 9.0)) return null
         }
-        // Which of the 12 ring rotations puts the top limbs on top?
+        // Which of the 12 ring rotations is upright?
         var h: DoubleArray? = null
         var bestScore = -Double.MAX_VALUE
         var starScore = 0.0
@@ -712,15 +788,21 @@ object Decoder {
             if (ss + ls > bestScore) { bestScore = ss + ls; h = hk; starScore = ss; logoScore = ls }
         }
         if (h == null || starScore < 0.3 || logoScore < 0.2) return null
-        h = refine(g, h, pol, null) ?: return null
-        repeat(2) { h = refine(g, h!!, pol, readStars(g, h!!, pol).symbols) ?: return null }
+        repeat(3) { h = refine(g, h!!, pol) ?: return null }
         val hf = h!!
-        val read = readStars(g, hf, pol)
+        val minContrast = FloatArray(1)
+        val limbs = classify(limbStrength(g, hf, pol, minContrast)) ?: return null
         sample(g, hf, LOGO_XY, logoBuf)
         logoScore = -pol * ncc(logoBuf, LogoTemplate.INK)
-        if (logoScore < 0.45 || read.top.min() < 0.3f || read.contrast.min() < 6f) return null
-        if (read.conf.count { it.min() < WEAK_CONFIDENCE } > MAX_WEAK_STARS) return null
-        val number = Spec.decodeSymbols(read.symbols)
+        if (logoScore < 0.45 || minContrast[0] < 6f || limbs.ratio <= 0.3 || limbs.ratio >= 0.97) return null
+        if (limbs.separation < MIN_SHADE_SEPARATION) return null
+        val starConf = DoubleArray(12) { i -> (0 until 5).minOf { limbs.conf[i * 5 + it] } }
+        if (starConf.count { it < WEAK_CONFIDENCE } > MAX_WEAK_STARS) return null
+        val symbols = IntArray(12) { i -> (0 until 5).fold(0) { acc, k -> (acc shl 1) or (if (limbs.solid[i * 5 + k]) 1 else 0) } }
+        // Rebuilding the two least certain stars is only safe when every other star is clear.
+        val order = (0 until 12).sortedBy { starConf[it] }
+        val canFill = starConf[order[2]] >= CLEAR_CONFIDENCE
+        val number = Spec.decodeSymbols(symbols, if (canFill) order[0] else -1, if (canFill) order[1] else -1)
         if (number < 0) return null
         val corners = DoubleArray(8)
         val hs = Spec.HALF
@@ -728,7 +810,7 @@ object Decoder {
         applyH(hf, hs, -hs, corners, 2)
         applyH(hf, hs, hs, corners, 4)
         applyH(hf, -hs, hs, corners, 6)
-        return ScanResult(number, FloatArray(8) { corners[it].toFloat() }, read.conf.minOf { it.min() }, logoScore.toFloat())
+        return ScanResult(number, FloatArray(8) { corners[it].toFloat() }, starConf.min().toFloat(), logoScore.toFloat())
     }
 
     /** Find and decode every code in the image. Not thread-safe: call from one thread at a time. */

@@ -25,10 +25,15 @@ def alpha(number, px_per_unit=3.0, supersample=3):
     side = int(round(2 * spec.HALF * s))
     canvas = np.zeros((side, side), np.uint8)
     shift = 6
-    for i, sym in enumerate(spec.encode(number)):
-        pts = np.array(spec.star_polygon(sym, *spec.star_center(i)))
-        pts = np.round((pts + spec.HALF) * s * (1 << shift)).astype(np.int32)
-        cv2.fillPoly(canvas, [pts], 255, lineType=cv2.LINE_AA, shift=shift)
+    to_px = lambda pts: np.round((np.array(pts) + spec.HALF) * s * (1 << shift)).astype(np.int32)
+    symbols = spec.encode(number)
+    for i, sym in enumerate(symbols):          # light limbs first, solid parts over them
+        for k in range(5):
+            if not spec.limb_solid(sym, k):
+                cv2.fillPoly(canvas, [to_px(spec.limb_polygon(k, *spec.star_center(i)))],
+                             int(round(255 * spec.SHADE)), lineType=cv2.LINE_AA, shift=shift)
+    for i, sym in enumerate(symbols):
+        cv2.fillPoly(canvas, [to_px(spec.star_polygon(sym, *spec.star_center(i)))], 255, lineType=cv2.LINE_AA, shift=shift)
     a = canvas.astype(np.float32) / 255.0
     lside = int(round(spec.LOGO_D * s))
     logo = cv2.resize(logo_alpha(), (lside, lside), interpolation=cv2.INTER_AREA)
