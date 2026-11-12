@@ -3,7 +3,10 @@
 Renders random codes, places them in a camera-like frame with perspective, blur,
 noise, uneven light and JPEG damage, scans them, and reports hit / miss / wrong.
 
-    .venv/bin/python bench.py [count] [level] [--save-fails DIR]
+    .venv/bin/python bench.py [count] [level] [--rings N | --rings LOW-HIGH] [--save-fails DIR]
+
+With --rings above 1 the frame is larger (1280 x 960, or 2560 x 1920 above 12 rings),
+since those codes need more pixels.
 """
 import glob
 import math
@@ -51,7 +54,7 @@ def scene_background(rng):
     kind = rng.random()
     if kind < 0.6 and backgrounds():
         src = backgrounds()[rng.integers(len(backgrounds()))]
-        s = rng.uniform(0.6, 1.0)
+        s = rng.uniform(0.6, 1.0) * min(1.0, (src.shape[1] - 1) / FRAME_W, (src.shape[0] - 1) / FRAME_H)
         w, h = int(FRAME_W * s), int(FRAME_H * s)
         x, y = rng.integers(0, src.shape[1] - w), rng.integers(0, src.shape[0] - h)
         return cv2.resize(src[y:y + h, x:x + w], (FRAME_W, FRAME_H))
@@ -70,11 +73,11 @@ def scene_background(rng):
     return img
 
 
-def placement(rng, diameter, tilt_deg):
+def placement(rng, diameter, tilt_deg, half=spec.HALF):
     """Homography from code model units to frame pixels, for a tilted plane seen by a pinhole camera."""
     f = 1.1 * FRAME_W
     roll, axis, tilt = rng.uniform(0, 2 * math.pi), rng.uniform(0, 2 * math.pi), math.radians(tilt_deg)
-    dist = f * 2 * spec.HALF / diameter
+    dist = f * 2 * half / diameter
     cr, sr = math.cos(roll), math.sin(roll)
     Rz = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]])
     ca, sa = math.cos(axis), math.sin(axis)
@@ -85,7 +88,7 @@ def placement(rng, diameter, tilt_deg):
     K = np.array([[f, 0, 0], [0, f, 0], [0, 0, 1]])
     H = K @ np.column_stack([Rm[:, 0], Rm[:, 1], [0, 0, dist]])
     H = H / H[2, 2]
-    corners = decode._apply(H, np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]], float) * spec.HALF)
+    corners = decode._apply(H, np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]], float) * half)
     lo, hi = corners.min(0), corners.max(0)
     span = hi - lo
     if span[0] > FRAME_W - 8 or span[1] > FRAME_H - 8:
@@ -95,24 +98,69 @@ def placement(rng, diameter, tilt_deg):
     return np.array([[1, 0, tx], [0, 1, ty], [0, 0, 1]]) @ H
 
 
-def make_case(seed, level=1.0):
-    """level scales how harsh the damage is; 1.0 is the default mix."""
+def random_center(rng):
+    """What sits in the middle of the code: (label, keyword arguments for render)."""
+    kind = rng.random()
+    if kind < 0.35:
+        return "logo", {}
+    if kind < 0.5:
+        return "none", dict(center=None)
+    if kind < 0.65:
+        return "logo moved", dict(center_scale=float(rng.uniform(0.35, 1.0)), center_rotation=float(rng.uniform(0, 360)))
+    pic = np.zeros((256, 256), np.uint8)
+    if kind < 0.8:                                   # letters
+        for _ in range(int(rng.integers(1, 4))):
+            cv2.putText(pic, chr(int(rng.integers(48, 91))), (int(rng.integers(10, 130)), int(rng.integers(110, 230))),
+                        cv2.FONT_HERSHEY_SIMPLEX, rng.uniform(2, 6), 255, int(rng.integers(4, 18)), cv2.LINE_AA)
+        label = "letters"
+    elif kind < 0.9 or not backgrounds():            # star-sized blobs, right up to the edge of the allowed circle
+        for _ in range(int(rng.integers(3, 14))):
+            a, r = rng.uniform(0, 2 * math.pi), rng.uniform(0, 100)
+            cv2.circle(pic, (int(128 + r * math.cos(a)), int(128 + r * math.sin(a))), int(rng.integers(10, 34)), 255, -1, cv2.LINE_AA)
+        label = "blobs"
+    else:                                            # a photograph
+        src = backgrounds()[rng.integers(len(backgrounds()))]
+        x, y = rng.integers(0, src.shape[1] - 400), rng.integers(0, src.shape[0] - 400)
+        pic = 255 - cv2.resize(cv2.cvtColor(src[y:y + 400, x:x + 400], cv2.COLOR_BGR2GRAY), (256, 256))
+        label = "photo"
+    return label, dict(center=pic.astype(np.float32) / 255, center_rotation=float(rng.uniform(0, 360)))
+
+
+def make_case(seed, level=1.0, rings=(1, 1)):
+    """level scales how harsh the damage is; 1.0 is the default mix. rings: (fewest, most)."""
+    global FRAME_W, FRAME_H
+    FRAME_W, FRAME_H = (960, 720) if rings[1] == 1 else (1280, 960) if rings[1] <= 12 else (2560, 1920)
     rng = np.random.default_rng(seed)
+    extra = np.random.default_rng(seed + 5 * 10 ** 8)
+    center_label, center = random_center(extra)
+    mirrored = extra.random() < 0.15
+    n_rings = int(extra.integers(rings[0], rings[1] + 1))
+    ec_level = int(extra.integers(0, spec.LEVELS))
+    half = spec.half_side(n_rings)
     number = int(rng.integers(0, spec.MAX_NUMBER))
     ink, bgc = random_colours(rng)
     while True:
-        diameter = float(np.exp(rng.uniform(math.log(90), math.log(560))))
+        # The same range of star sizes whatever the number of rings, as far as the frame allows.
+        diameter = float(np.exp(rng.uniform(math.log(90), math.log(560)))) * half / spec.HALF
         tilt = float(rng.uniform(0, 55))
-        H = placement(rng, diameter, tilt)
+        H = placement(rng, diameter, tilt, half) if diameter < FRAME_H else None
         if H is not None:
             break
-    px_per_unit = diameter / (2 * spec.HALF)
-    code = render.render(number, SRC_PPU, ink, bgc)
+    px_per_unit = diameter / (2 * half)
+    if n_rings == 1:
+        expected, code = number, number
+    else:
+        expected = extra.bytes(int(extra.integers(0, spec.capacity(n_rings, ec_level) + 1)))
+        code = spec.encode_message(expected, n_rings, ec_level)
+    SRC_PPU = 3.0 if n_rings <= 8 else 1.5         # big codes are rendered smaller, to bound memory
+    code = render.render(code, SRC_PPU, ink, bgc, supersample=3 if n_rings <= 8 else 2, **center)
+    if mirrored:
+        code = code[:, ::-1].copy()
     # Optionally the code is printed on a larger surface of the same background colour.
     pad = int(rng.choice([0, 0, 60, 400]))
     if pad:
         code = cv2.copyMakeBorder(code, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=bgc)
-    S = np.array([[1 / SRC_PPU, 0, -spec.HALF - pad / SRC_PPU], [0, 1 / SRC_PPU, -spec.HALF - pad / SRC_PPU], [0, 0, 1]])
+    S = np.array([[1 / SRC_PPU, 0, -half - pad / SRC_PPU], [0, 1 / SRC_PPU, -half - pad / SRC_PPU], [0, 0, 1]])
     M = H @ S
     shrink = SRC_PPU / px_per_unit
     if shrink > 1.5:
@@ -167,8 +215,8 @@ def make_case(seed, level=1.0):
     img = np.clip(img, 0, 255).astype(np.uint8)
     q = int(rng.uniform(100 - 65 * min(level, 1.0), 95))
     img = cv2.imdecode(cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, q])[1], cv2.IMREAD_COLOR)
-    meta = dict(seed=seed, number=number, diameter=diameter, tilt=tilt, blur=blur_units, motion=motion_units,
-                noise=noise, jpeg=q, gamma=gamma, contrast=abs(luma(ink) - luma(bgc)), H=H)
+    meta = dict(seed=seed, number=expected, rings=n_rings, ec=ec_level, star_px=39.0 * px_per_unit, diameter=diameter, tilt=tilt, blur=blur_units, motion=motion_units,
+                noise=noise, jpeg=q, gamma=gamma, center=center_label, mirrored=mirrored, contrast=abs(luma(ink) - luma(bgc)), H=H)
     return img, meta
 
 
@@ -180,14 +228,16 @@ def make_negative(seed):
 
 
 def run_case(args):
-    seed, level = args
-    img, meta = make_case(seed, level)
+    seed, level, rings = args
+    img, meta = make_case(seed, level, rings)
     found = decode.scan(img)
     if not found:
         meta["result"] = "miss"
-    elif len(found) == 1 and found[0]["number"] == meta["number"]:
+    elif len(found) == 1 and found[0]["key"] == meta["number"]:
         meta["result"] = "ok"
         meta["repaired"] = found[0]["repaired"]
+        if found[0]["mirrored"] != meta["mirrored"]:
+            meta["result"] = "wrong"
     else:
         meta["result"] = "wrong"
     return meta
@@ -195,6 +245,14 @@ def run_case(args):
 
 def run_negative(seed):
     return len(decode.scan(make_negative(seed)))
+
+
+def groups(rows, key, label):
+    print(f"\n  by {label}")
+    for value in sorted({r[key] for r in rows}, key=str):
+        sel = [r for r in rows if r[key] == value]
+        ok = sum(r["result"] == "ok" for r in sel)
+        print(f"    {str(value):<14} {100 * ok / len(sel):5.1f}%  ({ok}/{len(sel)})")
 
 
 def table(rows, key, edges, label):
@@ -213,29 +271,42 @@ def main():
         i = args.index("--save-fails")
         save = args[i + 1]
         del args[i:i + 2]
+    rings = (1, 1)
+    if "--rings" in args:
+        i = args.index("--rings")
+        lo, _, hi = args[i + 1].partition("-")
+        rings = (int(lo), int(hi or lo))
+        del args[i:i + 2]
     count = int(args[0]) if args else 1000
     level = float(args[1]) if len(args) > 1 else 1.0
     with Pool() as pool:
-        rows = pool.map(run_case, [(s, level) for s in range(count)], chunksize=8)
+        rows = pool.map(run_case, [(s, level, rings) for s in range(count)], chunksize=4)
         neg = pool.map(run_negative, range(10 ** 6, 10 ** 6 + count // 2), chunksize=8)
     ok = sum(r["result"] == "ok" for r in rows)
     wrong = [r for r in rows if r["result"] == "wrong"]
     print(f"decoded {ok}/{count} ({100 * ok / count:.1f}%), wrong number {len(wrong)}, "
           f"needed a star repaired {sum(r.get('repaired', 0) for r in rows)}")
     print(f"false positives on {len(neg)} code-free frames: {sum(n > 0 for n in neg)}")
-    table(rows, "diameter", [90, 130, 180, 250, 350, 560], "code width in px")
+    if rings[1] == 1:
+        table(rows, "diameter", [90, 130, 180, 250, 350, 560], "code width in px")
+    else:
+        groups(rows, "rings", "rings")
+        groups(rows, "ec", "error-correction level")
+    table(rows, "star_px", [10, 19, 26, 36, 50, 90], "star height in px")
     table(rows, "tilt", [0, 15, 30, 45, 55], "tilt in degrees")
     table(rows, "blur", [0, 0.01, 0.7, 1.4, 2.2, 9], "blur sigma, model units")
     table(rows, "motion", [0, 0.01, 3, 6, 99], "motion blur length, model units")
     table(rows, "contrast", [50, 80, 120, 256], "ink/background luma difference")
     table(rows, "gamma", [0.6, 0.8, 0.999, 1.001, 1.3, 1.71], "camera gamma")
+    groups(rows, "center", "centre picture")
+    groups(rows, "mirrored", "mirror image")
     fails = [r for r in rows if r["result"] != "ok"]
     print("\n  wrong seeds:", [r["seed"] for r in wrong])
     print("  missed seeds:", [r["seed"] for r in fails if r["result"] == "miss"][:60])
     if save:
         os.makedirs(save, exist_ok=True)
         for r in fails[:40]:
-            cv2.imwrite(os.path.join(save, f"{r['result']}_{r['seed']}.jpg"), make_case(r["seed"], level)[0])
+            cv2.imwrite(os.path.join(save, f"{r['result']}_{r['seed']}.jpg"), make_case(r["seed"], level, rings)[0])
 
 
 if __name__ == "__main__":

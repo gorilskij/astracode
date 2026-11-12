@@ -1,4 +1,4 @@
-"""Astracode format, version 2: geometry, symbol mapping and error-correcting code.
+"""Astracode format, version 2 with optional extra rings: geometry, symbol mapping and error-correcting code.
 
 All lengths are in model units, with the ring of star centres at radius 100
 around the origin; x to the right, y down.
@@ -10,7 +10,10 @@ Layout
     solid ink. Each of its five limbs is either solid (bit 1) or a lighter
     shade, SHADE of the way from background to ink (bit 0). The top limb is
     bit 4 of the star's 5-bit symbol, then clockwise bits 3, 2, 1, 0.
-  - The logo sits inside a circle of diameter LOGO_D at the centre.
+  - The centre may hold any picture (or nothing) inside a circle of radius
+    CENTER_R. Readers do not look at it. The band between that circle and
+    the stars must stay background colour. The Astra logo is drawn in a box
+    of side LOGO_D and reaches radius 72.9.
 
 Payload
   - 40 bits holding metadata * 10^10 + payload: a 10-digit payload (0 ..
@@ -27,6 +30,24 @@ Payload
   - The 12 symbols are XORed with MASK before drawing, so no code is a single
     flat shade.
 
+More rings
+  - A code may have up to MAX_RINGS rings. Ring k (the ring above is ring 0)
+    has 12 + 6k stars of the same size at radius 100 + RING_STEP * k, star 0 at
+    12 o'clock, then clockwise. Every ring has a star on each of the six
+    spokes at multiples of 60 degrees.
+  - Ring 0 is read exactly as above. Its 40-bit value says which kind of code
+    this is: below MAX_NUMBER it is a one-ring code as described above; from
+    MAX_NUMBER up it is a header, MAX_NUMBER + (rings << 28 | level << 26 |
+    first 26 message bits). So a ring 0 cut out of a bigger code never reads
+    as a one-ring code, and it tells the reader how many rings to expect.
+  - The stars of rings 1 and up, in order, are taken in pairs as 10-bit
+    symbols (first star = high 5 bits) forming one Reed-Solomon codeword over
+    GF(1024). Level 0..3 makes 1/8, 2/8, 3/8 or 4/8 of those symbols check
+    symbols. The check symbols also cover ring 0's 40-bit value (as four
+    leading symbols that are not drawn again), tying the rings together.
+  - The message is a byte string: its bits, then a 1 bit, then zeros to fill.
+  - Outer symbols are XORed with a fixed pseudo-random sequence before drawing.
+
 Version 1 (limbs present or absent, top limb fixed, 2 check stars) is in git
 history, tagged v1.0.
 """
@@ -37,6 +58,7 @@ STAR_RO = 19.5
 STAR_RATIO = math.sin(math.radians(18)) / math.sin(math.radians(54))  # regular pentagram, 0.38197
 STAR_RI = STAR_RO * STAR_RATIO
 LOGO_D = 180.0
+CENTER_R = 73.0              # the centre picture must stay within this radius
 MARGIN = 16.0
 HALF = R + STAR_RO + MARGIN  # half side of the full code square
 SHADE = 0.7                  # ink fraction of a light limb
@@ -203,22 +225,34 @@ def payload_of_member_id(text):
     return int(digits[:10])
 
 
-def encode(number):
-    """Stored value (see pack) -> the 12 symbols as drawn (masked)."""
-    if not 0 <= number < MAX_NUMBER:
-        raise ValueError("value out of range")
+def _encode_value(number):
+    """Any 40-bit value -> the 12 symbols of ring 0 as drawn (masked)."""
     mixed = mix(number)
     data = [(mixed >> (5 * (N_DATA - 1 - i))) & 31 for i in range(N_DATA)]
     cw = data + rs_parity(data)
     return [c ^ m for c, m in zip(cw, MASK)]
 
 
+def encode(number):
+    """Stored value (see pack) -> the 12 symbols of a one-ring code as drawn."""
+    if not 0 <= number < MAX_NUMBER:
+        raise ValueError("value out of range")
+    return _encode_value(number)
+
+
 def decode_symbols(symbols, doubtful=None):
-    """The 12 symbols as drawn -> (stored value, stars repaired), or None if the check fails.
+    """The 12 symbols of a one-ring code -> (stored value, stars repaired), or None.
 
     Repairs one misread star anywhere. If that fails and `doubtful` names two
-    stars the reader is unsure of, repairs exactly those two instead.
+    stars the reader is unsure of, repairs exactly those two instead. Ring 0 of
+    a code with more rings is refused here; see decode_message.
     """
+    res = _decode_value(symbols, doubtful)
+    return res if res is not None and res[0] < MAX_NUMBER else None
+
+
+def _decode_value(symbols, doubtful=None):
+    """The 12 symbols of ring 0 as drawn -> (40-bit value, stars repaired), or None."""
     cw = [s ^ m for s, m in zip(symbols, MASK)]
     res = rs_correct(cw)
     if res is None and doubtful is not None:
@@ -230,15 +264,230 @@ def decode_symbols(symbols, doubtful=None):
     mixed = 0
     for d in cw[:N_DATA]:
         mixed = (mixed << 5) | d
-    number = unmix(mixed)
-    return (number, repaired) if number < MAX_NUMBER else None
+    return unmix(mixed), repaired
+
+
+# ---------------------------------------------------------------- more rings
+
+MAX_RINGS = 24            # 1932 outer stars = 966 symbols, within GF(1024)'s 1023
+RING_STEP = 40.0          # radius added per ring
+LEVELS = 4                # error-correction levels 0..3
+_HEAD_BITS = 26           # message bits carried in ring 0 of a multi-ring code
+
+_EXP10 = [0] * 2046
+_LOG10 = [0] * 1024
+_x = 1
+for _i in range(1023):
+    _EXP10[_i] = _EXP10[_i + 1023] = _x
+    _LOG10[_x] = _i
+    _x <<= 1
+    if _x & 1024:
+        _x ^= 0x409  # x^10 + x^3 + 1
+
+
+def gf10_mul(a, b):
+    return 0 if a == 0 or b == 0 else _EXP10[_LOG10[a] + _LOG10[b]]
+
+
+def gf10_div(a, b):
+    return 0 if a == 0 else _EXP10[_LOG10[a] - _LOG10[b] + 1023]
+
+
+def ring_stars(k):
+    return 12 + 6 * k
+
+
+def ring_radius(k):
+    return R + RING_STEP * k
+
+
+def half_side(rings):
+    """Half side of the full code square for a code with this many rings."""
+    return ring_radius(rings - 1) + STAR_RO + MARGIN
+
+
+def outer_symbols(rings):
+    """Number of 10-bit symbols in rings 1 and up."""
+    return sum(ring_stars(k) for k in range(1, rings)) // 2
+
+
+def check_symbols(rings, level):
+    return max(2, -(-outer_symbols(rings) * (level + 1) // 8))
+
+
+def capacity_bits(rings, level):
+    return _HEAD_BITS + 10 * (outer_symbols(rings) - check_symbols(rings, level))
+
+
+def capacity(rings, level):
+    """Longest message, in bytes, a code with this many rings (2 or more) holds."""
+    return (capacity_bits(rings, level) - 1) // 8
+
+
+def _whiten(j):
+    return _mix_round(j, 0x2545F) & 1023
+
+
+_gen10 = {}
+
+
+def _generator10(p):
+    if p not in _gen10:
+        g = [1]
+        for j in range(p):            # roots a^0 .. a^(p-1)
+            g = [x ^ gf10_mul(y, _EXP10[j]) for x, y in zip(g + [0], [0] + g)]
+        _gen10[p] = g
+    return _gen10[p]
+
+
+def rs10_parity(data, p):
+    gen = _generator10(p)
+    rem = [0] * p
+    for d in data:
+        f = d ^ rem[0]
+        rem = rem[1:] + [0]
+        if f:
+            lf = _LOG10[f]
+            rem = [r ^ (_EXP10[lf + _LOG10[g]] if g else 0) for r, g in zip(rem, gen[1:])]
+    return rem
+
+
+def rs10_decode(cw, p, max_errors=None):
+    """Repair up to p // 2 wrong symbols (or max_errors). Returns (codeword, count) or None."""
+    n = len(cw)
+    synd = []
+    for j in range(p):
+        s = 0
+        for i, c in enumerate(cw):
+            if c:
+                s ^= _EXP10[(_LOG10[c] + j * (n - 1 - i)) % 1023]
+        synd.append(s)
+    if not any(synd):
+        return list(cw), 0
+    # Berlekamp-Massey: error locator, lowest degree first
+    loc, prev, shift, last, errs = [1], [1], 1, 1, 0
+    for i in range(p):
+        delta = synd[i]
+        for j in range(1, errs + 1):
+            if j < len(loc):
+                delta ^= gf10_mul(loc[j], synd[i - j])
+        if delta == 0:
+            shift += 1
+            continue
+        coef = gf10_div(delta, last)
+        nxt = loc + [0] * max(0, len(prev) + shift - len(loc))
+        for j, c in enumerate(prev):
+            nxt[j + shift] ^= gf10_mul(coef, c)
+        if 2 * errs <= i:
+            prev, last, errs, shift = loc, delta, i + 1 - errs, 1
+        else:
+            shift += 1
+        loc = nxt
+    while loc and loc[-1] == 0:
+        loc.pop()
+    if len(loc) - 1 != errs or errs > (p // 2 if max_errors is None else min(max_errors, p // 2)):
+        return None
+    # error evaluator: synd(x) * loc(x) mod x^p
+    omega = [0] * p
+    for i, a in enumerate(loc):
+        for j in range(p - i):
+            omega[i + j] ^= gf10_mul(a, synd[j])
+    fixed, found = list(cw), 0
+    for pos in range(n):
+        xinv = _EXP10[(1023 - pos) % 1023]
+        val, power = 0, 1
+        for c in loc:
+            val ^= gf10_mul(c, power)
+            power = gf10_mul(power, xinv)
+        if val:
+            continue
+        num, power = 0, 1
+        for c in omega:
+            num ^= gf10_mul(c, power)
+            power = gf10_mul(power, xinv)
+        den, power = 0, 1
+        x2 = gf10_mul(xinv, xinv)
+        for c in loc[1::2]:               # formal derivative keeps the odd terms
+            den ^= gf10_mul(c, power)
+            power = gf10_mul(power, x2)
+        if den == 0:
+            return None
+        fixed[n - 1 - pos] ^= gf10_mul(_EXP10[pos], gf10_div(num, den))
+        found += 1
+    return (fixed, errs) if found == errs else None
+
+
+def _virtual(value):
+    return [(value >> s) & 1023 for s in (30, 20, 10, 0)]
+
+
+def encode_message(message, rings, level=1):
+    """Byte string -> the symbols of every ring as drawn: [ring 0's 12, ring 1's 18, ...]."""
+    if not 2 <= rings <= MAX_RINGS or not 0 <= level < LEVELS:
+        raise ValueError("rings must be 2..%d and level 0..%d" % (MAX_RINGS, LEVELS - 1))
+    total = capacity_bits(rings, level)
+    if 8 * len(message) + 1 > total:
+        raise ValueError("message too long: at most %d bytes" % capacity(rings, level))
+    p = check_symbols(rings, level)
+    d = outer_symbols(rings) - p
+    stream = (int.from_bytes(message, "big") << 1 | 1) << (total - 8 * len(message) - 1)
+    data = [(stream >> (10 * (d - 1 - j))) & 1023 for j in range(d)]
+    value = MAX_NUMBER + (rings << 28 | level << 26 | stream >> (10 * d))
+    outer = [c ^ _whiten(j) for j, c in enumerate(data + rs10_parity(_virtual(value) + data, p))]
+    stars = [half for sym in outer for half in (sym >> 5, sym & 31)]
+    out, at = [_encode_value(value)], 0
+    for k in range(1, rings):
+        out.append(stars[at:at + ring_stars(k)])
+        at += ring_stars(k)
+    return out
+
+
+def read_header(symbols, doubtful=None):
+    """Ring 0 of a multi-ring code -> (rings, level, 40-bit value, stars repaired), or None."""
+    res = _decode_value(symbols, doubtful)
+    if res is None or res[0] < MAX_NUMBER:
+        return None
+    header = res[0] - MAX_NUMBER
+    rings, level = header >> 28, (header >> 26) & 3
+    return (rings, level, res[0], res[1]) if 2 <= rings <= MAX_RINGS else None
+
+
+def decode_message(ring_symbols):
+    """Symbols of every ring as drawn -> (message bytes, outer symbols repaired), or None."""
+    header = read_header(ring_symbols[0])
+    if header is None:
+        return None
+    rings, level, value, _ = header
+    if len(ring_symbols) != rings or any(len(ring_symbols[k]) != ring_stars(k) for k in range(rings)):
+        return None
+    stars = [s for ring in ring_symbols[1:] for s in ring]
+    outer = [(stars[2 * j] << 5 | stars[2 * j + 1]) ^ _whiten(j) for j in range(len(stars) // 2)]
+    p = check_symbols(rings, level)
+    # Two check symbols are always kept back for detection, so that a badly misread
+    # code is refused rather than "repaired" into a different message.
+    res = rs10_decode(_virtual(value) + outer, p, max_errors=(p - 2) // 2)
+    if res is None or res[0][:4] != _virtual(value):
+        return None
+    cw, repaired = res
+    d = len(outer) - p
+    stream = (value - MAX_NUMBER) & ((1 << _HEAD_BITS) - 1)
+    for sym in cw[4:4 + d]:
+        stream = stream << 10 | sym
+    if stream == 0:
+        return None
+    pad = (stream & -stream).bit_length()         # the final 1 bit and the zeros after it
+    nbits = capacity_bits(rings, level) - pad
+    if nbits % 8:
+        return None
+    return (stream >> pad).to_bytes(nbits // 8, "big"), repaired
 
 
 # ---------------------------------------------------------------- geometry
 
-def star_center(i):
-    a = math.radians(-90 + 30 * i)
-    return R * math.cos(a), R * math.sin(a)
+def star_center(i, ring=0):
+    a = math.radians(-90 + 360.0 * i / ring_stars(ring))
+    r = ring_radius(ring)
+    return r * math.cos(a), r * math.sin(a)
 
 
 def limb_solid(symbol, k):
@@ -285,18 +534,25 @@ def blend(background, ink, t):
 
 
 def svg(number, ink="#021639", background="#febc5c", size=512):
-    """The code for a stored value (see pack) as an SVG string."""
+    """The one-ring code for a stored value (see pack) as an SVG string."""
+    return svg_rings([encode(number)], ink, background, size)
+
+
+def svg_rings(ring_symbols, ink="#021639", background="#febc5c", size=512):
+    """A code as an SVG string, from the symbols of each ring (see encode_message)."""
+    half = half_side(len(ring_symbols))
     poly = lambda pts: '<polygon points="%s"/>' % " ".join("%.3f,%.3f" % p for p in pts)
     light = solid = ""
-    for i, sym in enumerate(encode(number)):
-        cx, cy = star_center(i)
-        light += "".join(poly(limb_polygon(k, cx, cy)) for k in range(5) if not limb_solid(sym, k))
-        solid += poly(star_polygon(sym, cx, cy))
+    for ring, symbols in enumerate(ring_symbols):
+        for i, sym in enumerate(symbols):
+            cx, cy = star_center(i, ring)
+            light += "".join(poly(limb_polygon(k, cx, cy)) for k in range(5) if not limb_solid(sym, k))
+            solid += poly(star_polygon(sym, cx, cy))
     k = LOGO_D / LOGO_SRC
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" '
-        f'viewBox="{-HALF} {-HALF} {2 * HALF} {2 * HALF}">'
-        f'<rect x="{-HALF}" y="{-HALF}" width="{2 * HALF}" height="{2 * HALF}" fill="{background}"/>'
+        f'viewBox="{-half} {-half} {2 * half} {2 * half}">'
+        f'<rect x="{-half}" y="{-half}" width="{2 * half}" height="{2 * half}" fill="{background}"/>'
         f'<g fill="{blend(background, ink, SHADE)}">{light}</g><g fill="{ink}">{solid}'
         f'<g transform="scale({k}) translate({-LOGO_SRC / 2} {-LOGO_SRC / 2}) {LOGO_TRANSFORM}">'
         f'{LOGO_PATHS}</g></g></svg>')

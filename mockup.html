@@ -18,8 +18,17 @@
 </style>
 
 <div id="controls">
-  <label><span>Metadata (0–108)</span><input type="number" id="meta" min="0" max="108" step="1" value="0"></label>
-  <label><span>Payload (up to 10 digits)</span><input type="text" id="num" inputmode="numeric" maxlength="10" value="4320880580"></label>
+  <label><span>Rings <b id="vRings"></b></span><input type="range" id="rings" min="1" max="24" step="1" value="1"></label>
+  <div id="one" style="display:grid;gap:12px">
+    <label><span>Metadata (0–108)</span><input type="number" id="meta" min="0" max="108" step="1" value="0"></label>
+    <label><span>Payload (up to 10 digits)</span><input type="text" id="num" inputmode="numeric" maxlength="10" value="4320880580"></label>
+  </div>
+  <div id="many" style="display:none;gap:12px">
+    <label><span>Error correction</span><select id="level">
+      <option value="0">0: 1/8 check symbols</option><option value="1" selected>1: 2/8 check symbols</option>
+      <option value="2">2: 3/8 check symbols</option><option value="3">3: 4/8 check symbols</option></select></label>
+    <label><span>Message</span><textarea id="msg" rows="4" style="font:14px ui-monospace,monospace;width:100%;box-sizing:border-box">https://astra-europa.example/</textarea></label>
+  </div>
   <div id="summary"></div>
   <div class="row">
     <button id="rand">Random</button>
@@ -36,6 +45,7 @@
     <button id="swap">Swap</button>
   </div>
   <div id="nibbles"></div>
+  <div style="color:#555">With 2 or more rings the code carries a text message: ring k has 12 + 6k stars at radius 100 + 40k, the inner ring says how many rings there are and the error-correction level, and all outer rings form one Reed-Solomon codeword. The current scanner reads one-ring codes only.</div>
   <div style="color:#555">Ring radius is fixed at 100; all sizes are relative to it. The scanner expects the defaults (star 19.5, logo 180); other values are for looking only. Every star is a full pentagram: each limb is solid or the lighter level, the centre is always solid; the scanner works out the lighter level for itself. The code stores metadata × 10¹⁰ + payload in 40 bits; stars 9 to 12 are check symbols. A member ID is the 10-digit payload followed by payload mod 97.</div>
 </div>
 
@@ -77,7 +87,7 @@ function limb(cx, cy, ro, k) {
   return `<polygon points="${pts.join(' ')}"/>`;
 }
 
-const mix = (bg, ink, t) => '#' + [1, 3, 5].map(i => {
+const blend = (bg, ink, t) => '#' + [1, 3, 5].map(i => {
   const a = parseInt(bg.slice(i, i + 2), 16), b = parseInt(ink.slice(i, i + 2), 16);
   return Math.round(a + (b - a) * t).toString(16).padStart(2, '0');
 }).join('');
@@ -113,8 +123,9 @@ function mix(value) {
   return BigInt(left) << 20n | BigInt(right);
 }
 
-// Stored value -> the 12 symbols as drawn: mixed, then 8 data symbols (5 bits each) and
-// 4 Reed-Solomon check symbols, masked.
+// Any 40-bit value -> the 12 symbols of ring 0 as drawn: mixed, then 8 data symbols (5 bits
+// each) and 4 Reed-Solomon check symbols, masked. One-ring codes hold values below MAX_NUMBER.
+const MAX_NUMBER = METADATA_LIMIT * PAYLOAD_LIMIT;
 function encode(value) {
   let n = mix(BigInt(value));
   const data = [];
@@ -126,6 +137,52 @@ function encode(value) {
   }
   return [...data, ...rem].map((c, i) => c ^ MASK[i]);
 }
+
+// More rings: ring k has 12 + 6k stars at radius 100 + 40k. Ring 0 holds a header,
+// MAX_NUMBER + (rings << 28 | level << 26 | first 26 message bits). The stars of rings 1 and
+// up, in pairs, are 10-bit symbols of one Reed-Solomon codeword over GF(1024) whose check
+// symbols also cover ring 0's value.
+const MAX_RINGS = 24, RING_STEP = 40, HEAD_BITS = 26;
+const EXP10 = [], LOG10 = [];
+for (let i = 0, x = 1; i < 1023; i++) { EXP10[i] = EXP10[i + 1023] = x; LOG10[x] = i; x <<= 1; if (x & 1024) x ^= 0x409; }
+const gf10Mul = (a, b) => (a && b) ? EXP10[LOG10[a] + LOG10[b]] : 0;
+const ringStars = k => 12 + 6 * k, ringRadius = k => R + RING_STEP * k;
+const outerSymbols = rings => { let n = 0; for (let k = 1; k < rings; k++) n += ringStars(k); return n / 2; };
+const checkSymbols = (rings, level) => Math.max(2, Math.ceil(outerSymbols(rings) * (level + 1) / 8));
+const capacityBits = (rings, level) => HEAD_BITS + 10 * (outerSymbols(rings) - checkSymbols(rings, level));
+const capacity = (rings, level) => Math.floor((capacityBits(rings, level) - 1) / 8);   // bytes
+const whiten = j => mixRound(j, 0x2545F) & 1023;
+
+function rs10Parity(data, p) {
+  let gen = [1];
+  for (let j = 0; j < p; j++) gen = [...gen, 0].map((x, i) => x ^ gf10Mul(i ? gen[i - 1] : 0, EXP10[j]));
+  let rem = Array(p).fill(0);
+  for (const d of data) {
+    const f = d ^ rem[0];
+    rem = rem.slice(1); rem.push(0);
+    if (f) for (let i = 0; i < p; i++) rem[i] ^= gf10Mul(f, gen[i + 1]);
+  }
+  return rem;
+}
+
+// Message bytes -> the symbols of every ring as drawn: [ring 0's 12, ring 1's 18, ...].
+function encodeMessage(bytes, rings, level) {
+  const total = capacityBits(rings, level), p = checkSymbols(rings, level), d = outerSymbols(rings) - p;
+  if (8 * bytes.length + 1 > total) throw new Error('message too long');
+  const bits = [];                                   // message bits, a 1, then zeros
+  for (const b of bytes) for (let i = 7; i >= 0; i--) bits.push((b >> i) & 1);
+  bits.push(1);
+  while (bits.length < total) bits.push(0);
+  const take = (from, count) => { let v = 0; for (let i = 0; i < count; i++) v = v * 2 + bits[from + i]; return v; };
+  const data = Array.from({ length: d }, (_, j) => take(HEAD_BITS + 10 * j, 10));
+  const value = MAX_NUMBER + (BigInt(rings) << 28n | BigInt(level) << 26n | BigInt(take(0, HEAD_BITS)));
+  const virtual = [30n, 20n, 10n, 0n].map(s => Number((value >> s) & 1023n));
+  const outer = [...data, ...rs10Parity([...virtual, ...data], p)].map((c, j) => c ^ whiten(j));
+  const stars = outer.flatMap(sym => [sym >> 5, sym & 31]);
+  const out = [encode(value)];
+  for (let k = 1, at = 0; k < rings; at += ringStars(k), k++) out.push(stars.slice(at, at + ringStars(k)));
+  return out;
+}
 // --- end payload encoding ---
 
 function render() {
@@ -133,28 +190,46 @@ function render() {
   $('vStar').textContent = ro; $('vLogo').textContent = lh; $('vPad').textContent = pad;
   const shade = +$('shade').value / 100;
   $('vShade').textContent = $('shade').value;
-  const payload = $('num').value.replace(/\D/g, '') || '0';
-  const meta = Math.trunc(+$('meta').value);
-  const metaOk = Number.isFinite(meta) && meta >= 0 && meta < Number(METADATA_LIMIT);
-  if (!metaOk) {
-    $('summary').innerHTML = '<span class="bad">Metadata must be a whole number from 0 to 108.</span>';
-    return;
+  const rings = +$('rings').value;
+  $('vRings').textContent = rings;
+  $('one').style.display = rings === 1 ? 'grid' : 'none';
+  $('many').style.display = rings === 1 ? 'none' : 'grid';
+  let symbols;                                       // per ring
+  if (rings === 1) {
+    const payload = $('num').value.replace(/\D/g, '') || '0';
+    const meta = Math.trunc(+$('meta').value);
+    const metaOk = Number.isFinite(meta) && meta >= 0 && meta < Number(METADATA_LIMIT);
+    if (!metaOk) {
+      $('summary').innerHTML = '<span class="bad">Metadata must be a whole number from 0 to 108.</span>';
+      return;
+    }
+    const value = pack(meta, payload);
+    $('summary').innerHTML = `member ID <b>${memberId(payload).replace(/(....)(....)(....)/, '$1 $2 $3')}</b><br>stored value ${value} (${value.toString(2).length} of 40 bits)`;
+    symbols = [encode(value)];
+  } else {
+    const level = +$('level').value, bytes = new TextEncoder().encode($('msg').value), cap = capacity(rings, level);
+    const count = 3 * rings * (rings + 3);
+    const info = `${count} stars, ${checkSymbols(rings, level)} of ${outerSymbols(rings)} outer symbols are check symbols`;
+    if (bytes.length > cap) {
+      $('summary').innerHTML = `<span class="bad">Message is ${bytes.length} bytes; this code holds ${cap}. Add rings or lower the error correction.</span><br>${info}`;
+      return;
+    }
+    $('summary').innerHTML = `<b>${bytes.length} of ${cap} bytes</b><br>${info}`;
+    symbols = encodeMessage(bytes, rings, level);
   }
-  const value = pack(meta, payload);
-  $('summary').innerHTML = `member ID <b>${memberId(payload).replace(/(....)(....)(....)/, '$1 $2 $3')}</b><br>stored value ${value} (${value.toString(2).length} of 40 bits)`;
-  const nib = override === null ? encode(value) : Array(12).fill(override);
-  $('nibbles').textContent = 'symbols: ' + nib.map(x => x.toString(32)).join(' ');
+  if (override !== null) symbols = symbols.map(ring => ring.map(() => override));
+  $('nibbles').textContent = rings > 3 ? '' : 'symbols: ' + symbols.map(ring => ring.map(x => x.toString(32)).join(' ')).join(' | ');
 
   let stars = '', light = '';
-  for (let i = 0; i < 12; i++) {
-    const a = (-90 + 30 * i) * Math.PI / 180, cx = R * Math.cos(a), cy = R * Math.sin(a);
-    for (let k = 0; k < 5; k++) if (!limbSolid(nib[i], k)) light += limb(cx, cy, ro, k);
-    stars += solidPart(cx, cy, ro, nib[i]);
-  }
-  const half = R + ro + pad, k = lh / LOGO_SRC;
+  symbols.forEach((ring, r) => ring.forEach((sym, i) => {
+    const a = (-90 + 360 * i / ring.length) * Math.PI / 180, cx = ringRadius(r) * Math.cos(a), cy = ringRadius(r) * Math.sin(a);
+    for (let k = 0; k < 5; k++) if (!limbSolid(sym, k)) light += limb(cx, cy, ro, k);
+    stars += solidPart(cx, cy, ro, sym);
+  }));
+  const half = ringRadius(rings - 1) + ro + pad, k = lh / LOGO_SRC;
   const svg = size => `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="${-half} ${-half} ${2 * half} ${2 * half}">
     <rect x="${-half}" y="${-half}" width="${2 * half}" height="${2 * half}" fill="${bg}"/>
-    <g fill="${mix(bg, fg, shade)}">${light}</g>
+    <g fill="${blend(bg, fg, shade)}">${light}</g>
     <g fill="${fg}">${stars}
       <g transform="scale(${k}) translate(${-LOGO_SRC / 2} ${-LOGO_SRC / 2}) ${LOGO_TF}">${LOGO}</g>
     </g></svg>`;
@@ -162,8 +237,13 @@ function render() {
   $('small').innerHTML = svg(160) + svg(80) + svg(40);
 }
 
-for (const el of document.querySelectorAll('input')) el.addEventListener('input', () => { if (el.id === 'num' || el.id === 'meta') override = null; render(); });
-$('rand').onclick = () => { override = null; $('num').value = String(Math.floor(Math.random() * 1e10)).padStart(10, '0'); render(); };
+for (const el of document.querySelectorAll('input, select, textarea')) el.addEventListener('input', () => { if (['num', 'meta', 'msg', 'rings', 'level'].includes(el.id)) override = null; render(); });
+$('rand').onclick = () => {
+  override = null;
+  if (+$('rings').value === 1) $('num').value = String(Math.floor(Math.random() * 1e10)).padStart(10, '0');
+  else $('msg').value = Array.from({ length: capacity(+$('rings').value, +$('level').value) }, () => 'abcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 36)]).join('');
+  render();
+};
 $('full').onclick = () => { override = 31; render(); };
 $('empty').onclick = () => { override = 0; render(); };
 $('swap').onclick = () => { const t = $('fg').value; $('fg').value = $('bg').value; $('bg').value = t; render(); };

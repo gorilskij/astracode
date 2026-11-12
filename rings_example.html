@@ -1,0 +1,103 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Astracode rings mockup</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 24px; background: #f4f4f2; color: #222; }
+  .row { display: flex; gap: 32px; flex-wrap: wrap; align-items: flex-start; }
+  .panel { width: 440px; flex: none; }
+  label { display: grid; grid-template-columns: 130px 250px 44px; font-variant-numeric: tabular-nums; gap: 8px; align-items: center; margin: 6px 0; }
+  button { margin: 4px 6px 4px 0; padding: 5px 10px; }
+  h3 { margin: 18px 0 6px; }
+  #info { margin-top: 12px; line-height: 1.6; }
+  .small { display: flex; gap: 16px; align-items: flex-end; margin-top: 16px; }
+  .small figure { margin: 0; text-align: center; color: #666; font-size: 12px; }
+</style>
+<h2>Astracode with extra rings (mockup, random data)</h2>
+<div class="row">
+  <div class="panel">
+    <label>rings <input type="range" id="rings" min="1" max="20" step="1" value="4"><span></span></label>
+    <label>ring spacing <input type="range" id="step" min="20" max="60" step="0.5" value="40"><span></span></label>
+    <label>stars per ring <select id="rule">
+      <option value="plus8">+8 per ring</option>
+      <option value="plus6">+6 per ring</option>
+      <option value="floor">proportional to radius, rounded down</option>
+      <option value="ceil">proportional to radius, rounded up</option>
+    </select><span></span></label>
+    <h3>Other</h3>
+    <label>light limbs % <input type="range" id="shade" min="30" max="95" step="5" value="80"><span></span></label>
+    <label>stagger rings <input type="checkbox" id="stagger"><span></span></label>
+    <div><button id="shuffle">New random data</button><button id="swap">Swap colours</button></div>
+    <div id="info"></div>
+  </div>
+  <div>
+    <div id="big"></div>
+    <div class="small" id="small"></div>
+  </div>
+</div>
+<script>
+const LOGO = `<path d="M338.37,465.61c23-62.6,49.94-122.56,81.41-172.56,19.82,31.52,37.88,67,54.29,104.62a1242.84,1242.84,0,0,1,128.34-46.05C485.58,134.07,419.78,91.42,419.78,91.42s-78.92,51.16-217.27,327C169,485.21,134,563.55,99.17,654.68,152.15,594.63,228.47,529.46,338.37,465.61Z"/><path d="M590.17,543.37c-16.66,11.13-34.06,23.38-51.87,36.74,49.12,170.74,70.06,328.47,70.06,328.47H825.5C776.38,741,723.47,603.64,672.6,492.63,646.63,507.34,618.78,524.25,590.17,543.37Z"/><path d="M982.17,298.05l-98-5.3-38.63-90.22a4,4,0,0,0-7.39.13l-35.32,91.58-97.75,8.86a4,4,0,0,0-2.16,7.07l51.57,41.89a1245.36,1245.36,0,0,0-135.25,31.47,1205.4,1205.4,0,0,0-131.61,46.65A1107.27,1107.27,0,0,0,384.41,480q-34.05,18.71-64,37.47c-149,93.34-225.58,186.86-264.91,259-42.9,78.78-41.47,132.11-41.47,132.11H231.19c58.29-158.17,179.5-278.94,296.43-364.38a1326.91,1326.91,0,0,1,130-83.58c46.2-26.07,86.34-45.26,114.42-57.74l-14.77,64.88a4,4,0,0,0,6.06,4.24l82.4-53.33L930.06,469a4,4,0,0,0,5.9-4.46l-25.25-94.84L984.58,305A4,4,0,0,0,982.17,298.05Z"/>`;
+const LOGO_SRC = 3840, LOGO_TF = 'translate(744.90 729.60) scale(2.671645) translate(-14.05 -91.42)';
+const RATIO = Math.sin(Math.PI / 10) / Math.sin(3 * Math.PI / 10);
+const $ = id => document.getElementById(id);
+const P = (cx, cy, r, deg) => { const a = deg * Math.PI / 180; return [cx + r * Math.cos(a), cy + r * Math.sin(a)]; };
+const fmt = pts => pts.map(p => p.map(v => v.toFixed(2)).join(',')).join(' ');
+function solidPart(cx, cy, ro, sym) {
+  const pts = [];
+  for (let k = 0; k < 5; k++) {
+    pts.push(P(cx, cy, ro * RATIO, -90 - 36 + 72 * k));
+    if ((sym >> (4 - k)) & 1) pts.push(P(cx, cy, ro, -90 + 72 * k));
+  }
+  return fmt(pts);
+}
+const limb = (cx, cy, ro, k) => fmt([P(cx, cy, ro * RATIO, -90 - 36 + 72 * k), P(cx, cy, ro, -90 + 72 * k), P(cx, cy, ro * RATIO, -90 + 36 + 72 * k), [cx, cy]]);
+const blend = (bg, ink, t) => '#' + [1, 3, 5].map(i => {
+  const a = parseInt(bg.slice(i, i + 2), 16), b = parseInt(ink.slice(i, i + 2), 16);
+  return Math.round(a + (b - a) * t).toString(16).padStart(2, '0');
+}).join('');
+
+let fg = '#021639', bg = '#febc5c', data = [];
+const shuffle = () => { data = Array.from({ length: 3000 }, () => Math.floor(Math.random() * 32)); };
+const PAD = 16;
+
+function render() {
+  for (const el of document.querySelectorAll('label input[type=range]')) el.nextElementSibling.textContent = el.value;
+  const rings = +$('rings').value, step = +$('step').value;
+  const spec = Array.from({ length: rings }, (_, i) => {
+    const r = 100 + step * i, exact = 12 * r / 100;      // same spacing along the ring as ring 1
+    const rule = $('rule').value;
+    return [rule === 'plus8' ? 12 + 8 * i : rule === 'plus6' ? 12 + 6 * i : rule === 'floor' ? Math.floor(exact + 1e-9) : Math.ceil(exact - 1e-9), r, 19.5];
+  });
+  const light = blend(bg, fg, +$('shade').value / 100);
+  let lightEls = '', solidEls = '', n = 0, half = 0;
+  spec.forEach(([count, r, ro], ri) => {
+    const off = $('stagger').checked && ri > 0 ? 180 / count : 0;
+    for (let i = 0; i < count; i++, n++) {
+      const [cx, cy] = P(0, 0, r, -90 + off + 360 / count * i), sym = data[n];
+      for (let k = 0; k < 5; k++) if (!((sym >> (4 - k)) & 1)) lightEls += `<polygon points="${limb(cx, cy, ro, k)}"/>`;
+      solidEls += `<polygon points="${solidPart(cx, cy, ro, sym)}"/>`;
+    }
+    half = Math.max(half, r + ro + PAD);
+  });
+  const k = 180 / LOGO_SRC;
+  const svg = size => `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="${-half} ${-half} ${2 * half} ${2 * half}">
+    <rect x="${-half}" y="${-half}" width="${2 * half}" height="${2 * half}" fill="${bg}"/>
+    <g fill="${light}">${lightEls}</g><g fill="${fg}">${solidEls}
+    <g transform="scale(${k}) translate(${-LOGO_SRC / 2} ${-LOGO_SRC / 2}) ${LOGO_TF}">${LOGO}</g></g></svg>`;
+  $('big').innerHTML = svg(620);
+  $('small').innerHTML = [300, 200, 120].map(s => `<figure>${svg(s)}<br>${s}px</figure>`).join('');
+  const base = 2 * (100 + 19.5 + PAD);
+  const gaps = spec.map(([count, r, ro], i) => {
+    const side = 2 * r * Math.sin(Math.PI / count) - 2 * ro * Math.cos(Math.PI / 10);
+    const radial = i ? r - ro - spec[i - 1][1] - spec[i - 1][2] : null;
+    return `ring ${i + 1}: ${count} stars, radius ${r}, gap between neighbours ${side.toFixed(1)}` + (radial === null ? '' : `, gap to inner ring ${radial.toFixed(1)}`);
+  });
+  $('info').innerHTML = `<b>${n} stars, ${5 * n} raw bits</b> (before error correction)<br>
+    code width ${(2 * half / base).toFixed(2)}× the 12-star code<br>
+    each star ${(base / (2 * half) * 100).toFixed(0)}% as many pixels across at the same printed size<br>
+    ${gaps.join('<br>')} <span style="color:#888">(ring 1 has 14.7; negative = overlap)</span>`;
+}
+for (const el of document.querySelectorAll('input, select')) el.addEventListener('input', render);
+$('shuffle').onclick = () => { shuffle(); render(); };
+$('swap').onclick = () => { [fg, bg] = [bg, fg]; render(); };
+shuffle(); render();
+</script>

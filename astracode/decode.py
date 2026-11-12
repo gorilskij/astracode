@@ -6,15 +6,17 @@ Pipeline (the same shape as a QR reader):
   3. Walk rings: from three neighbouring blobs, predict where the next star
      must be and step round until the ring closes after 12 (a few may be missing).
   4. Homography from the ring slots to the blob centres.
-  5. Resolve which of the 12 ring rotations is "up" by correlating the fixed
-     pattern: the logo, and the stars themselves (every star is a complete
-     upright pentagram, whatever its data).
+  5. Resolve which of the 12 ring rotations is "up" from the stars themselves:
+     every star is a complete upright pentagram, whatever its data. Whatever
+     is drawn in the centre is ignored.
   6. Refine: re-locate every star against the grey image by template match and
      refit the homography.
   7. Sample the five limbs of each star against the background beside them and
      that star's solid centre. Split all 60 limbs of the code into a light and
      a solid group, which calibrates the two shades for this photo.
   8. Reed-Solomon: repair at most one star, refuse if more look wrong.
+  9. If that fails, read the code as a mirror image (seen from behind glass);
+     a mirrored reading is accepted only if it needs no repair.
 
 Only steps 1-3 use the binary image; everything after samples grey levels.
 """
@@ -25,7 +27,6 @@ import cv2
 import numpy as np
 
 from . import spec
-from .render import logo_alpha
 
 # ------------------------------------------------------------ sample patterns
 
@@ -63,21 +64,9 @@ _NC, _NL, _NG = len(_CORE), _LIMB.shape[1], _GAP.shape[1]
 _ALL_STAR_PTS = (_CENTERS[:, None, :] + _STAR_PTS[None, :, :]).reshape(-1, 2)
 
 
-def _build_fixed_pattern():
-    """Model points whose ink value does not depend on the payload, with that value."""
-    la = cv2.GaussianBlur(logo_alpha(), (0, 0), 6)
-    ppu = la.shape[0] / spec.LOGO_D
-    g = np.arange(-68, 69, 4.0)
-    xy = np.array([(x, y) for x in g for y in g if x * x + y * y <= 70 * 70], np.float32)
-    px = np.clip(np.round((xy + spec.LOGO_D / 2) * ppu).astype(int), 0, la.shape[0] - 1)
-    logo_t = la[px[:, 1], px[:, 0]]
-    star = np.concatenate([_CORE, _LIMB.reshape(-1, 2), _GAP.reshape(-1, 2)])
-    star_t = np.concatenate([np.ones(_NC + 5 * _NL), np.zeros(5 * _NG)]).astype(np.float32)
-    sxy = (_CENTERS[:, None, :] + star[None]).reshape(-1, 2)
-    return (xy, logo_t), (sxy, np.tile(star_t, 12))
-
-
-(_LOGO_XY, _LOGO_T), (_FIX_XY, _FIX_T) = _build_fixed_pattern()
+# Model points whose ink value does not depend on the payload, with that value.
+_FIX_XY = _ALL_STAR_PTS
+_FIX_T = np.tile(np.concatenate([np.ones(_NC + 5 * _NL), np.zeros(5 * _NG)]).astype(np.float32), 12)
 
 # Dense star template for alignment: a grid over the star's disc, weighted + inside
 # the pentagram and - outside it. Every star has the same outline in this format.
@@ -172,7 +161,9 @@ _PREDICT_TOL = {3: 0.9, 4: 0.6, 5: 0.55}       # allowed miss, as a fraction of 
 # clutter. Blobs in a dense regular texture (screen pixel grids, halftone, fabric)
 # have many, and would otherwise support endless false rings. Scan first with a
 # strict limit, which is fast, and only if that finds nothing with a lenient one.
-_MAX_NEIGHBOURS = (12, 24)
+# The last pass has no limit: in a code with several rings every star is crowded.
+_MAX_NEIGHBOURS = (12, 24, 10 ** 9)
+_NEAREST = 8                                    # a star's ring neighbours are among its nearest similar blobs
 _WALK_BUDGET = 300000                           # ring-walk steps per binarised image
 
 
@@ -190,10 +181,20 @@ def _find_rings(pts, area, max_neighbours=_MAX_NEIGHBOURS[-1], max_missing=3):
     d = np.sqrt(((pts[:, None, :] - pts[None, :, :]) ** 2).sum(2))
     smax = np.maximum(s[:, None], s[None, :])
     smin = np.minimum(s[:, None], s[None, :])
+    def nearest(mask, keep):
+        out = []
+        for i, row in enumerate(mask):
+            idx = np.nonzero(row)[0]
+            if len(idx) > keep:
+                idx = idx[np.argsort(d[i, idx])[:keep]]
+            out.append(idx.tolist())
+        return out
+
     adj = (d > 0.8 * smax) & (d < 6.5 * smax) & (smax < 2.3 * smin)
-    nbrs = [np.nonzero(r)[0].tolist() for r in adj]
+    crowded = (adj.sum(1) > max_neighbours).tolist()
+    nbrs = nearest(adj, _NEAREST)
     # Wider neighbourhoods, for stepping across one missing star.
-    far = [np.nonzero(r)[0].tolist() for r in (d > 0.8 * smax) & (d < 13 * smax) & (smax < 2.3 * smin)]
+    far = nearest((d > 0.8 * smax) & (d < 13 * smax) & (smax < 2.3 * smin), 3 * _NEAREST)
     P = [(float(x), float(y)) for x, y in pts]
     S = s.tolist()
 
@@ -241,7 +242,6 @@ def _find_rings(pts, area, max_neighbours=_MAX_NEIGHBOURS[-1], max_missing=3):
 
     ring_of = [set() for _ in range(n)]
     seen = []
-    crowded = [len(nb) > max_neighbours for nb in nbrs]
     # Largest blobs first, so real stars are tried before fine texture.
     for b in np.argsort(-s).tolist():
         if len(nbrs[b]) < 2 or crowded[b] or budget[0] < 0:
@@ -278,12 +278,14 @@ def _find_rings(pts, area, max_neighbours=_MAX_NEIGHBOURS[-1], max_missing=3):
 
 # ------------------------------------------------------------ reading
 
-def _read_stars(gray, H):
+def _read_stars(gray, H, centers=_CENTERS):
     """Per star: core level, the 5 limb levels, and the 5 gap levels (gap k lies between limbs k and k+1)."""
-    v = _sample(gray, _apply(H, _ALL_STAR_PTS)).reshape(12, -1)
+    n = len(centers)
+    pts = (centers[:, None, :] + _STAR_PTS[None, :, :]).reshape(-1, 2)
+    v = _sample(gray, _apply(H, pts)).reshape(n, -1)
     core = v[:, :_NC].mean(1)
-    limb = v[:, _NC:_NC + 5 * _NL].reshape(12, 5, _NL).mean(2)
-    gap = v[:, _NC + 5 * _NL:].reshape(12, 5, _NG).mean(2)
+    limb = v[:, _NC:_NC + 5 * _NL].reshape(n, 5, _NL).mean(2)
+    gap = v[:, _NC + 5 * _NL:].reshape(n, 5, _NG).mean(2)
     return core, limb, gap
 
 
@@ -299,30 +301,67 @@ def _rot(k):
     return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
 
 
+def _ring_points(radius, count, offset=0.0):
+    a = np.radians(offset + 360.0 * np.arange(count) / count)
+    return np.stack([radius * np.cos(a), radius * np.sin(a)], 1).astype(np.float32)
+
+
+# The band between the centre picture and the stars is always background. In a code
+# with several rings, loops of twelve stars turn up that are not ring 0; they have
+# stars where this band should be.
+_BAND_XY = _ring_points(0.5 * (spec.CENTER_R + spec.R - spec.STAR_RO), 72)
+_BETWEEN_XY = _ring_points(spec.R, 12, 15.0)       # background, midway between ring 0 stars
+
+
+def _band_clear(gray, H0, pol):
+    core = _sample(gray, _apply(H0, _CENTERS)).mean()
+    bg = np.median(_sample(gray, _apply(H0, _BETWEEN_XY)))
+    ink = (bg - _sample(gray, _apply(H0, _BAND_XY))) / (bg - core + pol * 1e-3)
+    return (ink > 0.5).mean() <= 0.1
+
+
+_ORIENT_PTS = (_CENTERS[:, None, :] + _GRID[None, :, :]).reshape(-1, 2)
+_MIRROR = np.diag([-1.0, 1.0, 1.0])
+
+
 def _orient(gray, H0, pol):
-    """Pick which of the 12 ring rotations is upright. Returns (H, star score, logo score)."""
-    best = None
+    """Pick which of the 12 ring rotations has the stars upright. Returns (H, star score, margin).
+
+    Turning the ring by one star position tilts every star by 30 degrees. Five or
+    seven positions leave them only 6 degrees off upright, so this uses the dense
+    star outline, which notices that, rather than a few points per limb.
+    """
+    scores = []
     for k in range(12):
-        H = H0 @ _rot(k)
-        ss = -pol * _ncc(_sample(gray, _apply(H, _FIX_XY)), _FIX_T)
-        ls = -pol * _ncc(_sample(gray, _apply(H, _LOGO_XY)), _LOGO_T)
-        if best is None or ss + ls > best[0]:
-            best = (ss + ls, H, ss, ls)
-    return best[1], best[2], best[3]
+        v = _sample(gray, _apply(H0 @ _rot(k), _ORIENT_PTS)).reshape(12, -1)
+        scores.append(float(-pol * (v * _ALIGN_W).sum()))
+    order = np.argsort(scores)
+    H = H0 @ _rot(int(order[-1]))
+    star_score = -pol * _ncc(_sample(gray, _apply(H, _FIX_XY)), _FIX_T)
+    margin = (scores[order[-1]] - scores[order[-2]]) / (abs(scores[order[-1]]) + 1e-6)
+    return H, star_score, margin
 
 
-def _refine(gray, H, pol):
+def _locate(gray, H, pol, centers):
+    """Re-locate stars by template match around where H puts them. Returns their image positions."""
+    n = len(centers)
+    found = np.empty((n, 2))
+    for at in range(0, n, 64):                       # in batches, to bound memory
+        c = centers[at:at + 64]
+        pts = (c[:, None, None, :] + _SEARCH[None, :, None, :] + _GRID[None, None, :, :])
+        v = _sample(gray, _apply(H, pts.reshape(-1, 2))).reshape(len(c), len(_SEARCH), -1)
+        score = -pol * (v * _ALIGN_W).sum(2)
+        best = score.argmax(1)
+        for i in range(len(c)):
+            near = np.abs(_SEARCH - _SEARCH[best[i]]).max(1) <= 1.01
+            sc = score[i, near] - score[i, near].min() + 1e-6
+            found[at + i] = c[i] + (sc[:, None] * _SEARCH[near]).sum(0) / sc.sum()
+    return _apply(H, found)
+
+
+def _refine(gray, H, pol, centers=_CENTERS):
     """Re-locate every star by template match, then refit the homography."""
-    pts = (_CENTERS[:, None, None, :] + _SEARCH[None, :, None, :] + _GRID[None, None, :, :])
-    v = _sample(gray, _apply(H, pts.reshape(-1, 2))).reshape(12, len(_SEARCH), -1)
-    score = -pol * (v * _ALIGN_W).sum(2)
-    best = score.argmax(1)
-    found = np.empty((12, 2))
-    for i in range(12):
-        near = np.abs(_SEARCH - _SEARCH[best[i]]).max(1) <= 1.01
-        sc = score[i, near] - score[i, near].min() + 1e-6
-        found[i] = _CENTERS[i] + (sc[:, None] * _SEARCH[near]).sum(0) / sc.sum()
-    return _homography(_CENTERS, _apply(H, found))
+    return _homography(centers, _locate(gray, H, pol, centers))
 
 
 def _limb_strength(core, limb, gap, pol):
@@ -356,34 +395,50 @@ def _two_groups(v):
     return float(lo), float(hi)
 
 
-# Design matrix for the limb model:
+# Limb model:
 #   log strength = a[limb direction] + plane(star position) + d[star] + light * log(ratio)
-# Columns: 5 directions, 2 plane slopes, 12 per-star offsets, 1 light flag.
-_MODEL_A = np.zeros((60, 20))
-for _i in range(12):
-    for _k in range(5):
-        _MODEL_A[_i * 5 + _k, _k] = 1
-        _MODEL_A[_i * 5 + _k, 5] = _CENTERS[_i, 0] / spec.R
-        _MODEL_A[_i * 5 + _k, 6] = _CENTERS[_i, 1] / spec.R
-        _MODEL_A[_i * 5 + _k, 7 + _i] = 1
-del _i, _k
-# Ridge rows that pull the per-star offsets towards zero. A star's own five limbs
-# easily outweigh this, so a star dimmed by glare or shadow gets its own level; but
+# The per-star offsets d are pulled towards zero (ridge). A star's own five limbs
+# easily outweigh that, so a star dimmed by glare or shadow gets its own level; but
 # for a star whose limbs are all one shade, it is what says "that shade, at the usual
 # level" rather than "the other shade, at an unusual level".
 _STAR_RIDGE = 4.0
-_MODEL_PENALTY = np.zeros((12, 20))
-_MODEL_PENALTY[np.arange(12), 7 + np.arange(12)] = math.sqrt(_STAR_RIDGE)
 
 
-def _classify(strength):
-    """Decide light or solid for all 60 limbs. Returns (solid mask 12x5, confidence 12x5, ratio, separation).
+def _fit_limb_model(v, usable, light, centers):
+    """Least-squares fit of the limb model. Returns (v minus everything but the light term, log ratio).
+
+    The per-star offsets are eliminated exactly, star by star, which leaves an
+    8-column problem however many stars there are.
+    """
+    n = len(centers)
+    G = np.zeros((n, 5, 8))
+    G[:, np.arange(5), np.arange(5)] = 1
+    G[:, :, 5] = centers[:, :1] / spec.R
+    G[:, :, 6] = centers[:, 1:] / spec.R
+    G[:, :, 7] = light.reshape(n, 5)
+    V = v.reshape(n, 5)
+    U = usable.reshape(n, 5).astype(float)
+    count = U.sum(1)
+    # Minimising over d[star] leaves r' (I - 11'/(count + ridge)) r per star; this is its square root.
+    a = (1 - np.sqrt(_STAR_RIDGE / (count + _STAR_RIDGE))) / np.maximum(count, 1)
+    Gt = (G - a[:, None, None] * (G * U[:, :, None]).sum(1, keepdims=True)) * U[:, :, None]
+    Vt = (V - a[:, None] * (V * U).sum(1, keepdims=True)) * U
+    coef = np.linalg.lstsq(Gt.reshape(-1, 8), Vt.ravel(), rcond=None)[0]
+    r = V - G @ coef
+    d = (r * U).sum(1) / (count + _STAR_RIDGE)
+    resid = V - G[:, :, :7] @ coef[:7] - d[:, None]
+    return resid.ravel(), float(coef[7])
+
+
+def _classify(strength, centers=_CENTERS):
+    """Decide light or solid for every limb. Returns (solid mask n x 5, confidence n x 5, ratio, separation).
 
     Blur, motion and lighting weaken limbs unevenly: by limb direction (motion
     blur), smoothly across the code (perspective, focus), and star by star
     (glare, reflections). So rather than one threshold, fit a model with those
     three effects plus the light/solid ratio, alternating with the assignment.
     """
+    n = len(centers)
     flat = strength.ravel()
     # A limb washed out by glare or covered reads as hardly inked at all. Leave such
     # limbs out of the fit and report them with zero confidence.
@@ -391,13 +446,9 @@ def _classify(strength):
     v = np.log(np.maximum(flat, 1e-3))
     lo, hi = _two_groups(v[usable])
     light = v < 0.5 * (lo + hi)
-    A = _MODEL_A.copy()
-    zeros = np.zeros(12)
     for _ in range(10):
-        A[:, 19] = light
-        coef = np.linalg.lstsq(np.vstack([A[usable], _MODEL_PENALTY]), np.concatenate([v[usable], zeros]), rcond=None)[0]
-        log_ratio = min(coef[19], -0.05)
-        resid = v - A[:, :19] @ coef[:19]
+        resid, log_ratio = _fit_limb_model(v, usable, light, centers)
+        log_ratio = min(log_ratio, -0.05)
         new = resid < 0.5 * log_ratio
         if (new == light).all():
             break
@@ -407,7 +458,7 @@ def _classify(strength):
     conf[~usable] = 0
     err = np.where(light, resid - log_ratio, resid)[usable]
     separation = abs(log_ratio) / (err.std() + 1e-6)
-    return (~light).reshape(12, 5), conf.reshape(12, 5), float(np.exp(log_ratio)), float(separation)
+    return (~light).reshape(n, 5), conf.reshape(n, 5), float(np.exp(log_ratio)), float(separation)
 
 
 def _symbols(bits):
@@ -432,41 +483,97 @@ def _read_candidate(gray, centres, slots, pol, debug=None):
     back = _apply(np.linalg.inv(H0), centres)
     if np.sqrt(((back - model) ** 2).sum(1)).max() > 9:
         return None
-    H, star_score, logo_score = _orient(gray, H0, pol)
+    if not _band_clear(gray, H0, pol):
+        return None
+    H, star_score, margin = _orient(gray, H0, pol)
     if debug is not None:
-        debug.append(dict(stage="orient", star_score=star_score, logo_score=logo_score))
-    if star_score < 0.3 or logo_score < 0.2:
+        debug.append(dict(stage="orient", star_score=star_score, margin=margin))
+    if star_score < 0.3:
         return None
     for _ in range(3):
         H = _refine(gray, H, pol)
+    # A mirror image also shows twelve upright stars; it is the same ring read
+    # anticlockwise with each star's limbs swapped left to right.
+    return _read_oriented(gray, H, pol, False, debug) or _read_oriented(gray, H @ _MIRROR, pol, True, debug)
+
+
+def _read_oriented(gray, H, pol, mirrored, debug):
     core, limb, gap = _read_stars(gray, H)
     strength = _limb_strength(core, limb, gap, pol)
     contrast = -pol * (core - np.median(gap, 1))
-    logo_score = -pol * _ncc(_sample(gray, _apply(H, _LOGO_XY)), _LOGO_T)
     bits, conf, ratio, separation = _classify(strength)
-    info = dict(stage="read", H=H, star_score=star_score, logo_score=logo_score, limb_min=float(strength.min()),
+    info = dict(stage="read", H=H, mirrored=mirrored, limb_min=float(strength.min()),
                 contrast_min=float(contrast.min()), conf_min=float(conf.min()), ratio=ratio,
                 separation=separation, strength=strength, bits=bits)
     if debug is not None:
         debug.append(info)
-    if logo_score < 0.45 or contrast.min() < 6 or not 0.3 < ratio < 0.97:
+    if contrast.min() < 6 or not 0.3 < ratio < 0.97:
         return None
     if separation < MIN_SHADE_SEPARATION or (conf.min(1) < WEAK_CONFIDENCE).sum() > MAX_WEAK_STARS:
         return None
     # Rebuilding the two least certain stars is only safe when every other star is clear.
     order = np.argsort(conf.min(1))
     doubtful = (int(order[0]), int(order[1])) if conf[order[2]].min() >= CLEAR_CONFIDENCE else None
-    decoded = spec.decode_symbols(_symbols(bits), doubtful=doubtful)
+    if mirrored:
+        doubtful = None
+    symbols = _symbols(bits)
+    decoded = spec.decode_symbols(symbols, doubtful)
     if decoded is None:
+        header = spec.read_header(symbols, doubtful)
+        if header is None or (mirrored and header[3]):
+            return None
+        return _read_rings(gray, H, pol, mirrored, header, debug)
+    if mirrored and decoded[1]:
         return None
     number, repaired = decoded
     outline = _apply(H, np.array([[-spec.HALF, -spec.HALF], [spec.HALF, -spec.HALF],
                                   [spec.HALF, spec.HALF], [-spec.HALF, spec.HALF]]))
     metadata, payload = spec.unpack(number)
-    return dict(number=number, text="%012d" % number, metadata=metadata, payload=payload,
-                member_id=spec.member_id(payload), corners=outline, repaired=repaired,
-                confidence=float(conf.min()), logo_score=logo_score, separation=separation,
+    return dict(key=number, rings=1, number=number, text="%012d" % number, metadata=metadata, payload=payload,
+                member_id=spec.member_id(payload), corners=outline, repaired=repaired, mirrored=mirrored,
+                confidence=float(conf.min()), separation=separation,
                 ratio=ratio, bit_confidence=conf)
+
+
+_RING_CENTERS = [np.array([spec.star_center(i, k) for i in range(spec.ring_stars(k))], np.float32)
+                 for k in range(spec.MAX_RINGS)]
+
+
+def _read_rings(gray, H, pol, mirrored, header, debug):
+    """Read the outer rings of a code whose ring 0 announced them."""
+    rings, level, value, _ = header
+    # Work outwards: each ring is located with the fit from the rings inside it, then joins the fit.
+    centers = _CENTERS
+    found = _apply(H, _CENTERS)
+    for k in range(1, rings):
+        centers = np.concatenate([centers, _RING_CENTERS[k]])
+        for attempt in range(2):
+            here = _locate(gray, H, pol, _RING_CENTERS[k])
+            H = _homography(centers, np.concatenate([found, here]))
+        found = np.concatenate([found, here])
+    core, limb, gap = _read_stars(gray, H, centers)
+    strength = _limb_strength(core, limb, gap, pol)
+    contrast = -pol * (core - np.median(gap, 1))
+    bits, conf, ratio, separation = _classify(strength, centers)
+    if debug is not None:
+        debug.append(dict(stage="rings", H=H, rings=rings, level=level, contrast_min=float(contrast.min()),
+                          ratio=ratio, separation=separation, strength=strength, bits=bits, conf=conf))
+    if not 0.3 < ratio < 0.97 or separation < MIN_SHADE_SEPARATION:
+        return None
+    symbols, at = _symbols(bits), 12
+    ring_symbols = [spec._encode_value(value)]       # ring 0 as its (possibly repaired) header says
+    for k in range(1, rings):
+        ring_symbols.append(symbols[at:at + spec.ring_stars(k)])
+        at += spec.ring_stars(k)
+    decoded = spec.decode_message(ring_symbols)
+    if decoded is None:
+        return None
+    message, repaired = decoded
+    half = spec.half_side(rings)
+    outline = _apply(H, np.array([[-half, -half], [half, -half], [half, half], [-half, half]]))
+    return dict(key=message, rings=rings, level=level, message=message, text=message.decode("utf-8", "replace"),
+                corners=outline, repaired=repaired, mirrored=mirrored, confidence=float(conf.min()),
+                separation=separation, ratio=ratio, bit_confidence=conf)
 
 
 def scan_gray(gray, debug=None):
@@ -488,8 +595,10 @@ def scan_gray(gray, debug=None):
         for pol, pts, area in passes:
             for idx, slots in _find_rings(pts, area, limit):
                 r = _read_candidate(gray, pts[idx] / scale, slots, pol, debug)
-                if r is not None and all(r["number"] != q["number"] for q in results):
+                if r is not None and all(r["key"] != q["key"] for q in results):
                     results.append(r)
+                if results and limit > 1000:         # the slow pass: one code is enough
+                    return results
         if results:
             break
     return results
@@ -516,4 +625,5 @@ if __name__ == "__main__":
             continue
         found = scan(img)
         print(path, ", ".join("metadata %d, payload %010d (member ID %s)" % (r["metadata"], r["payload"], r["member_id"])
+                              if r["rings"] == 1 else "%d rings, level %d: %r" % (r["rings"], r["level"], r["text"])
                               for r in found) or "no code")
