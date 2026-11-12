@@ -10,7 +10,10 @@ Pipeline (the same shape as a QR reader):
      every star is a complete upright pentagram, whatever its data. Whatever
      is drawn in the centre is ignored.
   6. Refine: re-locate every star against the grey image by template match and
-     refit the homography.
+     refit the homography. Each star is then read where it was actually found
+     (smoothed over its neighbours), not where the flat fit puts it, so a
+     curved or wavy surface is followed locally. Every star acts as what a QR
+     code calls an alignment pattern.
   7. Sample the five limbs of each star against the background beside them and
      that star's solid centre. Split all 60 limbs of the code into a light and
      a solid group, which calibrates the two shades for this photo.
@@ -242,8 +245,16 @@ def _find_rings(pts, area, max_neighbours=_MAX_NEIGHBOURS[-1], max_missing=3):
 
     ring_of = [set() for _ in range(n)]
     seen = []
-    # Largest blobs first, so real stars are tried before fine texture.
-    for b in np.argsort(-s).tolist():
+    # Largest blobs first, so real stars are tried before fine texture. In the pass for
+    # crowded blobs, which is the one that finds codes with several rings, start instead
+    # from the middle of the crowd: that is where ring 0 is, and everything further out
+    # only offers look-alike loops.
+    order = np.argsort(-s)
+    dense = adj.sum(1) > _MAX_NEIGHBOURS[0]
+    if max_neighbours > 1000 and dense.sum() >= 12:
+        middle = np.median(pts[dense], 0)
+        order = np.argsort(((pts - middle) ** 2).sum(1))
+    for b in order.tolist():
         if len(nbrs[b]) < 2 or crowded[b] or budget[0] < 0:
             continue
         bx, by = P[b]
@@ -278,11 +289,51 @@ def _find_rings(pts, area, max_neighbours=_MAX_NEIGHBOURS[-1], max_missing=3):
 
 # ------------------------------------------------------------ reading
 
-def _read_stars(gray, H, centers=_CENTERS):
-    """Per star: core level, the 5 limb levels, and the 5 gap levels (gap k lies between limbs k and k+1)."""
-    n = len(centers)
-    pts = (centers[:, None, :] + _STAR_PTS[None, :, :]).reshape(-1, 2)
-    v = _sample(gray, _apply(H, pts)).reshape(n, -1)
+def _jacobians(H, centers):
+    """Local linear map from model offsets to image offsets at each star: (n, 2, 2)."""
+    c = np.asarray(centers, np.float64)
+    p = _apply(H, c)
+    return np.stack([_apply(H, c + [1.0, 0.0]) - p, _apply(H, c + [0.0, 1.0]) - p], 2)
+
+
+def _local_fit(H, centers, found):
+    """Where and how to read each star on a surface that may not be flat: (positions, local maps).
+
+    Around each star, how far its neighbours were found from the flat fit H is
+    fitted with a small linear model: its constant term moves the star, its
+    slope adjusts the star's local scale and rotation. One star's measured
+    position is noisy; a neighbourhood's is not. The slope is held towards zero
+    (ridge), so with few neighbours, as in a one-ring code, this reduces to a
+    weighted average of the offsets.
+    """
+    c = np.asarray(centers, np.float64)
+    res = found - _apply(H, c)
+    jac = _jacobians(H, c)
+    pos = np.empty_like(res)
+    ridge = np.diag([0.0, _SLOPE_RIDGE, _SLOPE_RIDGE])
+    for at in range(0, len(c), 256):
+        d = c[None, :, :] - c[at:at + 256, None, :]                    # m x n x 2, neighbour minus star
+        w = np.exp(-(d ** 2).sum(2) / (2 * _LOCAL_SIGMA ** 2))
+        X = np.concatenate([np.ones(d.shape[:2] + (1,)), d], 2)        # m x n x 3
+        A = np.einsum("mn,mni,mnj->mij", w, X, X) + ridge
+        coef = np.linalg.solve(A, np.einsum("mn,mni,nj->mij", w, X, res))   # m x 3 x 2
+        pos[at:at + 256] = coef[:, 0, :]
+        jac[at:at + 256] += coef[:, 1:, :].transpose(0, 2, 1)
+    return _apply(H, c) + pos, jac
+
+
+_LOCAL_SIGMA = 45.0          # neighbourhood size, model units
+_SLOPE_RIDGE = 3000.0
+
+
+def _read_stars(gray, pos, jac):
+    """Per star: core level, the 5 limb levels, and the 5 gap levels (gap k lies between limbs k and k+1).
+
+    pos: image position of each star's centre; jac: its local model-to-image map.
+    """
+    n = len(pos)
+    pts = pos[:, None, :] + np.einsum("nij,pj->npi", jac, _STAR_PTS.astype(np.float64))
+    v = _sample(gray, pts.reshape(-1, 2)).reshape(n, -1)
     core = v[:, :_NC].mean(1)
     limb = v[:, _NC:_NC + 5 * _NL].reshape(n, 5, _NL).mean(2)
     gap = v[:, _NC + 5 * _NL:].reshape(n, 5, _NG).mean(2)
@@ -314,10 +365,13 @@ _BETWEEN_XY = _ring_points(spec.R, 12, 15.0)       # background, midway between 
 
 
 def _band_clear(gray, H0, pol):
+    """The band inside ring 0, and the gaps between its stars, must be background."""
     core = _sample(gray, _apply(H0, _CENTERS)).mean()
-    bg = np.median(_sample(gray, _apply(H0, _BETWEEN_XY)))
-    ink = (bg - _sample(gray, _apply(H0, _BAND_XY))) / (bg - core + pol * 1e-3)
-    return (ink > 0.5).mean() <= 0.1
+    band = _sample(gray, _apply(H0, _BAND_XY))
+    between = _sample(gray, _apply(H0, _BETWEEN_XY))
+    bg = np.median(np.concatenate([band, between]))
+    scale = bg - core + pol * 1e-3
+    return ((bg - band) / scale > 0.5).mean() <= 0.1 and ((bg - between) / scale > 0.5).sum() <= 1
 
 
 _ORIENT_PTS = (_CENTERS[:, None, :] + _GRID[None, :, :]).reshape(-1, 2)
@@ -475,7 +529,9 @@ CLEAR_CONFIDENCE = 0.4      # what every other star must reach before two stars 
 MIN_SHADE_SEPARATION = 4.0  # gap between the two shades, in units of their spread
 
 
-def _read_candidate(gray, centres, slots, pol, debug=None):
+def _read_candidate(gray, centres, slots, pol, debug=None, tried=None, count=None):
+    if debug is not None:
+        debug.append(dict(stage="candidate"))
     ang = np.radians(30.0 * slots)
     model = np.stack([spec.R * np.cos(ang), spec.R * np.sin(ang)], 1)
     H0 = _homography(model, centres)
@@ -485,20 +541,90 @@ def _read_candidate(gray, centres, slots, pol, debug=None):
         return None
     if not _band_clear(gray, H0, pol):
         return None
+    if count is not None:
+        count["plausible"] += 1
     H, star_score, margin = _orient(gray, H0, pol)
     if debug is not None:
         debug.append(dict(stage="orient", star_score=star_score, margin=margin))
     if star_score < 0.3:
         return None
-    for _ in range(3):
+    # The same ring turns up many times: in each binarised image, and with different
+    # stars missing. If this placement has been read already, do not read it again.
+    marks = _apply(H, _MARKS)
+    if tried is not None:
+        tol = 3.0 * math.hypot(*(marks[1] - marks[0])) / 100.0           # 3 model units
+        if any(np.abs(marks - m).max() < tol for m in tried):
+            return None
+        tried.append(marks)
+    H = _refine(gray, H, pol)
+    if not _stars_fit(gray, H, pol) or _centre_is_code(gray, H, pol):
+        return None
+    for _ in range(2):
         H = _refine(gray, H, pol)
     # A mirror image also shows twelve upright stars; it is the same ring read
     # anticlockwise with each star's limbs swapped left to right.
-    return _read_oriented(gray, H, pol, False, debug) or _read_oriented(gray, H @ _MIRROR, pol, True, debug)
+    return (_read_oriented(gray, H, pol, False, debug, count)
+            or _read_oriented(gray, H @ _MIRROR, pol, True, debug, count))
 
 
-def _read_oriented(gray, H, pol, mirrored, debug):
-    core, limb, gap = _read_stars(gray, H)
+_MARKS = np.array([[0.0, 0.0], [100.0, 0.0], [0.0, 100.0]])
+_SIZE_PTS = [(_CENTERS[:, None, :] + k * _GRID[None, :, :]).reshape(-1, 2) for k in (0.85, 1.0, 1.18)]
+_QUIET_XY = _ring_points(spec.R + spec.STAR_RO + 0.5 * spec.MARGIN, 72)
+
+
+def _stars_fit(gray, H, pol):
+    """Are the stars the right size for this ring?
+
+    Deep inside a code with many rings, a star's twelve second-nearest
+    neighbours form a loop that passes for ring 0, except that its stars are
+    too big for it. Compare the star outline at three sizes.
+    """
+    small, right, big = (float(-pol * (_sample(gray, _apply(H, p)).reshape(12, -1) * _ALIGN_W).sum()) for p in _SIZE_PTS)
+    return right > 0 and (big - small) / right <= 0.06
+
+
+_INNER_SCALES = (1.0, 1.2, 1.4)
+_INNER_NEAR = np.array([(x, y) for x in (-6, -3, 0, 3, 6) for y in (-6, -3, 0, 3, 6)], np.float64)
+_INNER_ALL = np.array([(x, y) for x in np.arange(-66, 67, 3.0) for y in np.arange(-66, 67, 3.0)
+                       if x * x + y * y <= 66 * 66], np.float64)
+
+
+def _centre_is_code(gray, H, pol):
+    """Is the middle of this loop itself part of a code: a star just like the loop's own, with more around it?
+
+    That is what the look-alike loops deep inside a big code have. Any other
+    picture is fine there, including a single star of any size.
+    """
+    def score(at, k):
+        pts = (at[:, None, :] + k * _GRID[None, :, :]).reshape(-1, 2)
+        return -pol * (_sample(gray, _apply(H, pts)).reshape(len(at), -1) * _ALIGN_W).sum(1)
+
+    ring = [float(score(_CENTERS.astype(np.float64), k).mean()) for k in _INNER_SCALES]
+    k = _INNER_SCALES[int(np.argmax(ring))]
+    need = 0.7 * max(ring)
+    if need <= 0 or score(_INNER_NEAR, k).max() < need:
+        return False                                   # no star like the ring's at the centre
+    sc = score(_INNER_ALL, k)
+    stars = []                                         # distinct stars: strongest first, at least 25 units apart
+    for i in np.argsort(-sc):
+        if sc[i] < need:
+            break
+        if all(np.hypot(*(_INNER_ALL[i] - q)) >= 25 for q in stars):
+            stars.append(_INNER_ALL[i])
+    return len(stars) >= 5
+
+
+def _quiet(gray, H, pol):
+    """A one-ring code has clear margin outside its stars; ring 0 of a bigger code, or a look-alike loop, does not."""
+    core = _sample(gray, _apply(H, _CENTERS)).mean()
+    bg = np.median(_sample(gray, _apply(H, _BETWEEN_XY)))
+    ink = (bg - _sample(gray, _apply(H, _QUIET_XY))) / (bg - core + pol * 1e-3)
+    return (ink > 0.5).mean() <= 0.1
+
+
+def _read_oriented(gray, H, pol, mirrored, debug, count=None):
+    found = _locate(gray, H, pol, _CENTERS)
+    core, limb, gap = _read_stars(gray, *_local_fit(H, _CENTERS, found))
     strength = _limb_strength(core, limb, gap, pol)
     contrast = -pol * (core - np.median(gap, 1))
     bits, conf, ratio, separation = _classify(strength)
@@ -522,8 +648,10 @@ def _read_oriented(gray, H, pol, mirrored, debug):
         header = spec.read_header(symbols, doubtful)
         if header is None or (mirrored and header[3]):
             return None
-        return _read_rings(gray, H, pol, mirrored, header, debug)
-    if mirrored and decoded[1]:
+        if count is not None:
+            count["headers"] += 1
+        return _read_rings(gray, H, pol, mirrored, header, found, debug)
+    if (mirrored and decoded[1]) or not _quiet(gray, H, pol):
         return None
     number, repaired = decoded
     outline = _apply(H, np.array([[-spec.HALF, -spec.HALF], [spec.HALF, -spec.HALF],
@@ -539,19 +667,101 @@ _RING_CENTERS = [np.array([spec.star_center(i, k) for i in range(spec.ring_stars
                  for k in range(spec.MAX_RINGS)]
 
 
-def _read_rings(gray, H, pol, mirrored, header, debug):
+_kernels = {}
+
+
+def _star_kernel(ppu):
+    """The dense star template as a correlation kernel at ppu pixels per model unit."""
+    key = round(ppu, 2)
+    if key not in _kernels:
+        r = int(math.ceil(22 * ppu))
+        fine = 4
+        n = 2 * r + 1
+        g = ((np.arange(n * fine) + 0.5) / fine - n / 2) / ppu           # model units, sub-pixel grid
+        xx, yy = np.meshgrid(g, g)
+        mask = np.zeros(xx.shape, np.uint8)
+        poly = (np.array(spec.star_polygon(31)) * ppu * fine + n * fine / 2 - 0.5)
+        cv2.fillPoly(mask, [np.round(poly * 64).astype(np.int32)], 1, shift=6)
+        ink = mask.astype(np.float32)
+        out = ((xx * xx + yy * yy <= 22 * 22) & (mask == 0)).astype(np.float32)
+        ink = ink.reshape(n, fine, n, fine).sum((1, 3))
+        out = out.reshape(n, fine, n, fine).sum((1, 3))
+        _kernels[key] = ink / ink.sum() - out / out.sum()
+    return _kernels[key]
+
+
+_SEARCH_UNITS = 5.0                 # how far from its predicted place a star is looked for
+_CHUNKS = (3, 7, 15, spec.MAX_RINGS)   # re-straighten the image after this many rings are located
+
+
+def _predict_ring(model_new, model_known, where_known, use_all):
+    """Predict where new stars are from a local affine fit to their nearest located neighbours."""
+    if use_all:
+        idx = np.tile(np.arange(len(model_known)), (len(model_new), 1))
+    else:
+        d2 = ((model_new[:, None, :] - model_known[None, :, :]) ** 2).sum(2)
+        idx = np.argpartition(d2, 8, axis=1)[:, :8]
+    X = np.concatenate([model_known[idx], np.ones(idx.shape + (1,))], 2)      # n x q x 3
+    Y = where_known[idx]                                                       # n x q x 2
+    XtX = np.einsum("nqi,nqj->nij", X, X) + 1e-9 * np.eye(3)
+    coef = np.linalg.solve(XtX, np.einsum("nqi,nqj->nij", X, Y))               # n x 3 x 2
+    return np.einsum("ni,nij->nj", np.concatenate([model_new, np.ones((len(model_new), 1))], 1), coef)
+
+
+def _locate_rings(gray, H, pol, rings, found0):
+    """Image positions of every star of rings 0..rings-1, working outwards from ring 0.
+
+    The image is straightened with the fit so far and correlated with the star
+    template once; each new ring is then looked for where its already located
+    neighbours say it should be, which follows a surface that is not flat.
+    """
+    centers = [np.asarray(c, np.float64) for c in _RING_CENTERS[:rings]]
+    found = [found0]
+    native = math.sqrt(abs(np.linalg.det(_jacobians(H, np.zeros((1, 2)))[0])))
+    ppu = float(np.clip(native, 0.8, 2.0))
+    kernel = _star_kernel(ppu)
+    done = 1
+    for stop in _CHUNKS:
+        stop = min(stop, rings)
+        if stop <= done:
+            continue
+        known = np.concatenate(centers[:done])
+        Hfit = _homography(known, np.concatenate(found))
+        half = spec.ring_radius(stop - 1) + spec.STAR_RO + 12
+        side = int(math.ceil(2 * half * ppu))
+        to_image = Hfit @ np.array([[1 / ppu, 0, -half], [0, 1 / ppu, -half], [0, 0, 1]])   # straightened px -> image
+        flat = cv2.warpPerspective(gray, to_image, (side, side), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+        score = -pol * cv2.filter2D(flat, cv2.CV_32F, kernel, borderType=cv2.BORDER_REPLICATE)
+        from_image = np.linalg.inv(to_image)
+        where = [_apply(from_image, f) for f in found]                 # located stars, in straightened px
+        r = int(math.ceil(_SEARCH_UNITS * ppu))
+        dy, dx = np.mgrid[-r:r + 1, -r:r + 1]
+        for k in range(done, stop):
+            recent = slice(max(0, k - 2), k)
+            guess = _predict_ring(centers[k], np.concatenate(centers[recent]), np.concatenate(where[recent]), k == 1)
+            gx = np.clip(np.round(guess[:, 0]).astype(int), r + 1, side - r - 2)
+            gy = np.clip(np.round(guess[:, 1]).astype(int), r + 1, side - r - 2)
+            win = score[gy[:, None, None] + dy, gx[:, None, None] + dx].reshape(len(guess), -1)
+            best = win.argmax(1)
+            bx, by = gx + dx.ravel()[best], gy + dy.ravel()[best]
+            # sub-pixel: centroid of the 3 x 3 scores around the peak
+            sy, sx = np.mgrid[-1:2, -1:2]
+            near = score[by[:, None, None] + sy, bx[:, None, None] + sx].reshape(len(guess), 9)
+            wgt = near - near.min(1, keepdims=True) + 1e-6
+            here = np.stack([bx + (wgt * sx.ravel()).sum(1) / wgt.sum(1), by + (wgt * sy.ravel()).sum(1) / wgt.sum(1)], 1)
+            where.append(here)
+            found.append(_apply(to_image, here))
+        done = stop
+    return found
+
+
+def _read_rings(gray, H, pol, mirrored, header, found0, debug):
     """Read the outer rings of a code whose ring 0 announced them."""
     rings, level, value, _ = header
-    # Work outwards: each ring is located with the fit from the rings inside it, then joins the fit.
-    centers = _CENTERS
-    found = _apply(H, _CENTERS)
-    for k in range(1, rings):
-        centers = np.concatenate([centers, _RING_CENTERS[k]])
-        for attempt in range(2):
-            here = _locate(gray, H, pol, _RING_CENTERS[k])
-            H = _homography(centers, np.concatenate([found, here]))
-        found = np.concatenate([found, here])
-    core, limb, gap = _read_stars(gray, H, centers)
+    found = np.concatenate(_locate_rings(gray, H, pol, rings, found0))
+    centers = np.concatenate(_RING_CENTERS[:rings])
+    H = _homography(centers, found)
+    core, limb, gap = _read_stars(gray, *_local_fit(H, centers, found))
     strength = _limb_strength(core, limb, gap, pol)
     contrast = -pol * (core - np.median(gap, 1))
     bits, conf, ratio, separation = _classify(strength, centers)
@@ -576,11 +786,21 @@ def _read_rings(gray, H, pol, mirrored, header, debug):
                 separation=separation, ratio=ratio, bit_confidence=conf)
 
 
-def scan_gray(gray, debug=None):
+# Stars are looked for at full resolution. Set this to a size in pixels (1280, say) to look
+# for them in a shrunken copy instead: quicker on large frames without a code, but small
+# stars are missed. Reading always uses the full image.
+FIND_SIZE = None
+
+
+_MAX_LOOPS = 600            # loops of twelve looked at per image
+_MAX_PLAUSIBLE = 30         # of those, how many may pass the first checks
+
+
+def scan_gray(gray, debug=None, count=None):
     """Find and decode codes in a single-channel image. Returns a list of results."""
     gray = np.ascontiguousarray(gray, np.float32)
     h, w = gray.shape
-    scale = min(1.0, 1280.0 / max(h, w))
+    scale = 1.0 if FIND_SIZE is None else min(1.0, FIND_SIZE / max(h, w))
     small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else gray
     small = cv2.GaussianBlur(small, (0, 0), 1.0)
     max_area = (min(small.shape) / 5.0) ** 2
@@ -590,16 +810,27 @@ def scan_gray(gray, debug=None):
         for pol in (1, -1):                      # 1: dark ink on light, -1: light ink on dark
             binary = ((diff * pol) < -7).astype(np.uint8)
             passes.append((pol,) + _blobs(binary, max_area))
-    results = []
+    results, tried = [], []
+    count = dict(plausible=0, headers=0, gave_up=False) if count is None else count
+    loops, plausible = 0, count["plausible"]
     for limit in _MAX_NEIGHBOURS:
         for pol, pts, area in passes:
             for idx, slots in _find_rings(pts, area, limit):
-                r = _read_candidate(gray, pts[idx] / scale, slots, pol, debug)
+                # A real ring turns up early (the pass for crowded blobs starts its search
+                # where ring 0 would be). If it has not, give up on the frame rather than
+                # work through every look-alike loop in a big code. And once a ring 0 has
+                # announced more rings, no other loop in the frame can be the answer.
+                loops += 1
+                if loops > _MAX_LOOPS or count["plausible"] - plausible > _MAX_PLAUSIBLE:
+                    count["gave_up"] = True
+                if count["headers"] or count["gave_up"]:
+                    return results
+                r = _read_candidate(gray, pts[idx] / scale, slots, pol, debug, tried, count)
                 if r is not None and all(r["key"] != q["key"] for q in results):
                     results.append(r)
                 if results and limit > 1000:         # the slow pass: one code is enough
                     return results
-        if results:
+        if results or count["headers"]:
             break
     return results
 
@@ -608,10 +839,16 @@ def scan(image, debug=None):
     """Find and decode codes in a BGR or grey image. Falls back to single colour channels."""
     if image.ndim == 2:
         return scan_gray(image, debug)
-    results = scan_gray(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), debug)
+    count = dict(plausible=0, headers=0, gave_up=False)
+    results = scan_gray(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), debug, count)
     if not results:
         for ch in range(3):
-            results = scan_gray(image[..., ch], debug)
+            # The single channels are for colour pairs that vanish in grey. If grey showed a
+            # ring 0 whose outer rings could not be read, or a crowd of stars with no
+            # readable ring among them, they will not do better.
+            if count["headers"] or count["gave_up"]:
+                break
+            results = scan_gray(image[..., ch], debug, count)
             if results:
                 break
     return results

@@ -3,7 +3,10 @@
 Renders random codes, places them in a camera-like frame with perspective, blur,
 noise, uneven light and JPEG damage, scans them, and reports hit / miss / wrong.
 
-    .venv/bin/python bench.py [count] [level] [--rings N | --rings LOW-HIGH] [--save-fails DIR]
+    .venv/bin/python bench.py [count] [level] [--rings N | --rings LOW-HIGH] [--wavy STRAIN] [--save-fails DIR]
+
+--wavy 0.1 prints the code on a surface that is not flat: smooth waves that stretch
+and squeeze it locally by up to 10%.
 
 With --rings above 1 the frame is larger (1280 x 960, or 2560 x 1920 above 12 rings),
 since those codes need more pixels.
@@ -18,6 +21,9 @@ import cv2
 import numpy as np
 
 from astracode import decode, render, spec
+
+# ASTRA_SHADE=0.5 renders the light limbs at another level (the scanner works it out for itself).
+spec.SHADE = float(os.environ.get("ASTRA_SHADE", spec.SHADE))
 
 FRAME_W, FRAME_H = 960, 720
 SRC_PPU = 3.0
@@ -101,6 +107,12 @@ def placement(rng, diameter, tilt_deg, half=spec.HALF):
 def random_center(rng):
     """What sits in the middle of the code: (label, keyword arguments for render)."""
     kind = rng.random()
+    if os.environ.get("ASTRA_CENTER") == "star":     # a single upright star, from code-star size to filling the circle
+        pic = np.zeros((256, 256), np.uint8)
+        r = rng.uniform(0.27, 0.95) * 128
+        pts = np.array(spec.star_polygon(31)) * r / spec.STAR_RO + 128
+        cv2.fillPoly(pic, [np.round(pts * 64).astype(np.int32)], 255, cv2.LINE_AA, shift=6)
+        return "star %s" % ("small" if r < 0.4 * 128 else "big"), dict(center=pic.astype(np.float32) / 255)
     if kind < 0.35:
         return "logo", {}
     if kind < 0.5:
@@ -126,7 +138,23 @@ def random_center(rng):
     return label, dict(center=pic.astype(np.float32) / 255, center_rotation=float(rng.uniform(0, 360)))
 
 
-def make_case(seed, level=1.0, rings=(1, 1)):
+def wave(code, seed, strain, px_per_unit):
+    """Bend the code image with two smooth waves, as on a sheet that does not lie flat."""
+    rng = np.random.default_rng(seed + 7 * 10 ** 8)
+    h, w = code.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    mx, my = xx.copy(), yy.copy()
+    for _ in range(2):
+        lam = rng.uniform(150, 700) * px_per_unit            # wavelength
+        amp = rng.uniform(0, strain) * lam / (2 * math.pi)   # so the local stretch is at most `strain`
+        th, psi, ph = rng.uniform(0, 2 * math.pi, 3)
+        d = amp * np.sin(2 * math.pi * (xx * math.cos(th) + yy * math.sin(th)) / lam + ph)
+        mx += (d * math.cos(psi)).astype(np.float32)
+        my += (d * math.sin(psi)).astype(np.float32)
+    return cv2.remap(code, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+
+def make_case(seed, level=1.0, rings=(1, 1), wavy=0.0):
     """level scales how harsh the damage is; 1.0 is the default mix. rings: (fewest, most)."""
     global FRAME_W, FRAME_H
     FRAME_W, FRAME_H = (960, 720) if rings[1] == 1 else (1280, 960) if rings[1] <= 12 else (2560, 1920)
@@ -154,6 +182,8 @@ def make_case(seed, level=1.0, rings=(1, 1)):
         code = spec.encode_message(expected, n_rings, ec_level)
     SRC_PPU = 3.0 if n_rings <= 8 else 1.5         # big codes are rendered smaller, to bound memory
     code = render.render(code, SRC_PPU, ink, bgc, supersample=3 if n_rings <= 8 else 2, **center)
+    if wavy:
+        code = wave(code, seed, wavy, SRC_PPU)
     if mirrored:
         code = code[:, ::-1].copy()
     # Optionally the code is printed on a larger surface of the same background colour.
@@ -228,8 +258,8 @@ def make_negative(seed):
 
 
 def run_case(args):
-    seed, level, rings = args
-    img, meta = make_case(seed, level, rings)
+    seed, level, rings, wavy = args
+    img, meta = make_case(seed, level, rings, wavy)
     found = decode.scan(img)
     if not found:
         meta["result"] = "miss"
@@ -277,10 +307,15 @@ def main():
         lo, _, hi = args[i + 1].partition("-")
         rings = (int(lo), int(hi or lo))
         del args[i:i + 2]
+    wavy = 0.0
+    if "--wavy" in args:
+        i = args.index("--wavy")
+        wavy = float(args[i + 1])
+        del args[i:i + 2]
     count = int(args[0]) if args else 1000
     level = float(args[1]) if len(args) > 1 else 1.0
     with Pool() as pool:
-        rows = pool.map(run_case, [(s, level, rings) for s in range(count)], chunksize=4)
+        rows = pool.map(run_case, [(s, level, rings, wavy) for s in range(count)], chunksize=4)
         neg = pool.map(run_negative, range(10 ** 6, 10 ** 6 + count // 2), chunksize=8)
     ok = sum(r["result"] == "ok" for r in rows)
     wrong = [r for r in rows if r["result"] == "wrong"]
@@ -306,7 +341,7 @@ def main():
     if save:
         os.makedirs(save, exist_ok=True)
         for r in fails[:40]:
-            cv2.imwrite(os.path.join(save, f"{r['result']}_{r['seed']}.jpg"), make_case(r["seed"], level, rings)[0])
+            cv2.imwrite(os.path.join(save, f"{r['result']}_{r['seed']}.jpg"), make_case(r["seed"], level, rings, wavy)[0])
 
 
 if __name__ == "__main__":
