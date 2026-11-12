@@ -5,8 +5,9 @@ noise, uneven light and JPEG damage, scans them, and reports hit / miss / wrong.
 
     .venv/bin/python bench.py [count] [level] [--rings N | --rings LOW-HIGH] [--wavy STRAIN] [--save-fails DIR]
 
---wavy 0.1 prints the code on a surface that is not flat: smooth waves that stretch
-and squeeze it locally by up to 10%.
+--wavy 0.1 prints the code on a surface that is not flat: smooth waves, about as long
+as the code is wide, that stretch and squeeze it locally by up to 10%. At 0.3 the
+code is visibly bent out of shape.
 
 With --rings above 1 the frame is larger (1280 x 960, or 2560 x 1920 above 12 rings),
 since those codes need more pixels.
@@ -15,6 +16,7 @@ import glob
 import math
 import os
 import sys
+import time
 from multiprocessing import Pool
 
 import cv2
@@ -138,15 +140,15 @@ def random_center(rng):
     return label, dict(center=pic.astype(np.float32) / 255, center_rotation=float(rng.uniform(0, 360)))
 
 
-def wave(code, seed, strain, px_per_unit):
+def wave(code, seed, strain, width):
     """Bend the code image with two smooth waves, as on a sheet that does not lie flat."""
     rng = np.random.default_rng(seed + 7 * 10 ** 8)
     h, w = code.shape[:2]
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
     mx, my = xx.copy(), yy.copy()
-    for _ in range(2):
-        lam = rng.uniform(150, 700) * px_per_unit            # wavelength
-        amp = rng.uniform(0, strain) * lam / (2 * math.pi)   # so the local stretch is at most `strain`
+    for share in (rng.uniform(0.6, 1.0), rng.uniform(0.0, 0.5)):     # one main wave and a weaker one across it
+        lam = rng.uniform(0.5, 1.5) * width                  # wavelength: about the width of the code
+        amp = share * strain * lam / (2 * math.pi)           # so each wave's local stretch is at most `strain`
         th, psi, ph = rng.uniform(0, 2 * math.pi, 3)
         d = amp * np.sin(2 * math.pi * (xx * math.cos(th) + yy * math.sin(th)) / lam + ph)
         mx += (d * math.cos(psi)).astype(np.float32)
@@ -182,14 +184,16 @@ def make_case(seed, level=1.0, rings=(1, 1), wavy=0.0):
         code = spec.encode_message(expected, n_rings, ec_level)
     SRC_PPU = 3.0 if n_rings <= 8 else 1.5         # big codes are rendered smaller, to bound memory
     code = render.render(code, SRC_PPU, ink, bgc, supersample=3 if n_rings <= 8 else 2, **center)
-    if wavy:
-        code = wave(code, seed, wavy, SRC_PPU)
     if mirrored:
         code = code[:, ::-1].copy()
     # Optionally the code is printed on a larger surface of the same background colour.
     pad = int(rng.choice([0, 0, 60, 400]))
+    if wavy:                       # room for the waves to push the outer stars into
+        pad = max(pad, int(0.4 * wavy * code.shape[0]))
     if pad:
         code = cv2.copyMakeBorder(code, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=bgc)
+    if wavy:
+        code = wave(code, seed, wavy, code.shape[0] - 2 * pad)
     S = np.array([[1 / SRC_PPU, 0, -half - pad / SRC_PPU], [0, 1 / SRC_PPU, -half - pad / SRC_PPU], [0, 0, 1]])
     M = H @ S
     shrink = SRC_PPU / px_per_unit
@@ -260,7 +264,9 @@ def make_negative(seed):
 def run_case(args):
     seed, level, rings, wavy = args
     img, meta = make_case(seed, level, rings, wavy)
+    start = time.perf_counter()
     found = decode.scan(img)
+    meta["seconds"] = time.perf_counter() - start
     if not found:
         meta["result"] = "miss"
     elif len(found) == 1 and found[0]["key"] == meta["number"]:
@@ -322,6 +328,10 @@ def main():
     print(f"decoded {ok}/{count} ({100 * ok / count:.1f}%), wrong number {len(wrong)}, "
           f"needed a star repaired {sum(r.get('repaired', 0) for r in rows)}")
     print(f"false positives on {len(neg)} code-free frames: {sum(n > 0 for n in neg)}")
+    for label, sel in (("read", [r for r in rows if r["result"] == "ok"]), ("missed", [r for r in rows if r["result"] == "miss"])):
+        if sel:
+            t = np.array([r["seconds"] for r in sel])
+            print(f"scan time, {label}: median {np.median(t):.2f}s, 90% under {np.percentile(t, 90):.2f}s, slowest {t.max():.2f}s")
     if rings[1] == 1:
         table(rows, "diameter", [90, 130, 180, 250, 350, 560], "code width in px")
     else:
