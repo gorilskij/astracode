@@ -49,7 +49,7 @@
   </div>
   <div id="nibbles"></div>
   <div style="color:#555">A code holds a string of bits, usually bytes, and gets as many rings as that needs: one ring holds 38 bits (4 bytes), and ring k has 12 + 6k stars at radius 100 + 40k. Ring 0 says how many rings there are and the error-correction level, and all outer rings form one Reed-Solomon codeword. An Astra member number is a payload of exactly 38 bits, so it always fills one ring and cannot be mistaken for bytes. The centre picture is not read: anything, or nothing, may go there, as long as it stays inside radius 73.</div>
-  <div style="color:#555">Ring radius is fixed at 100; all sizes are relative to it. The scanner expects the defaults (star 19.5, logo 180); other values are for looking only. Every star is a full pentagram: each limb is solid or the lighter level, the centre is always solid; the scanner works out the lighter level for itself. The code stores metadata × 10¹⁰ + payload in 40 bits; stars 9 to 12 are check symbols. A member ID is the 10-digit payload followed by payload mod 97.</div>
+  <div style="color:#555">Ring radius is fixed at 100; all sizes are relative to it. The scanner expects the defaults (star 19.5, logo 180); other values are for looking only. Every star is a full five-pointed star, the shape of the one in the logo: each limb is solid or the lighter level, the centre is always solid; the scanner works out the lighter level for itself. The code stores metadata × 10¹⁰ + payload in 40 bits; stars 9 to 12 are check symbols. A member ID is the 10-digit payload followed by payload mod 97.</div>
 </div>
 
 <div id="previews">
@@ -62,7 +62,7 @@ const LOGO = `<path d="M338.37,465.61c23-62.6,49.94-122.56,81.41-172.56,19.82,31
 // Placement from the source file: a 3840 square whose centre is the code's centre. Not re-centred.
 const LOGO_SRC = 3840, LOGO_TF = 'translate(744.90 729.60) scale(2.671645) translate(-14.05 -91.42)';
 const R = 100;
-const RATIO = Math.sin(Math.PI / 10) / Math.sin(3 * Math.PI / 10); // regular pentagram
+const RATIO = 0.4437, ROUNDING = 0.0256; // the star of the Astra mark: inner / outer radius, and the arc rounding each tip / outer radius
 const $ = id => document.getElementById(id);
 let override = null; // null | 15 | 0
 
@@ -73,21 +73,32 @@ const P = (cx, cy, r, deg) => {
 // Bit 4 of a star's symbol is the top limb, then clockwise bits 3..0. 1 = solid, 0 = light.
 const limbSolid = (symbol, k) => (symbol >> (4 - k)) & 1;
 
+// Limb k's rounded tip as path commands: a line to where the arc leaves one edge, and the arc to the other.
+function tip(cx, cy, ro, k) {
+  const rad = d => d * Math.PI / 180, axis = -90 + 72 * k;
+  const at = (r, deg) => [cx + r * Math.cos(rad(deg)), cy + r * Math.sin(rad(deg))];
+  const point = at(ro, axis), r = ROUNDING * ro;
+  const half = Math.atan2(ro * RATIO * Math.sin(rad(36)), ro - ro * RATIO * Math.cos(rad(36)));
+  const leave = side => {
+    const notch = at(ro * RATIO, axis + side), len = Math.hypot(notch[0] - point[0], notch[1] - point[1]), cut = r / Math.tan(half);
+    return (point[0] + (notch[0] - point[0]) * cut / len).toFixed(3) + ',' + (point[1] + (notch[1] - point[1]) * cut / len).toFixed(3);
+  };
+  return `L${leave(-36)} A${r.toFixed(3)},${r.toFixed(3)} 0 0 1 ${leave(36)} `;
+}
+
 // The solid part of a star: centre pentagon plus its solid limbs.
 function solidPart(cx, cy, ro, symbol) {
-  const pts = [];
+  let d = '';
   for (let k = 0; k < 5; k++) {
-    pts.push(P(cx, cy, ro * RATIO, -90 - 36 + 72 * k));
-    if (limbSolid(symbol, k)) pts.push(P(cx, cy, ro, -90 + 72 * k));
+    d += (k ? 'L' : 'M') + P(cx, cy, ro * RATIO, -90 - 36 + 72 * k) + ' ';
+    if (limbSolid(symbol, k)) d += tip(cx, cy, ro, k);
   }
-  return `<polygon points="${pts.join(' ')}"/>`;
+  return `<path d="${d}Z"/>`;
 }
 
 // One limb, closed through the star centre so it tucks under the solid centre without a seam.
 function limb(cx, cy, ro, k) {
-  const pts = [P(cx, cy, ro * RATIO, -90 - 36 + 72 * k), P(cx, cy, ro, -90 + 72 * k),
-               P(cx, cy, ro * RATIO, -90 + 36 + 72 * k), P(cx, cy, 0, 0)];
-  return `<polygon points="${pts.join(' ')}"/>`;
+  return `<path d="M${P(cx, cy, ro * RATIO, -90 - 36 + 72 * k)} ${tip(cx, cy, ro, k)}L${P(cx, cy, ro * RATIO, -90 + 36 + 72 * k)} L${P(cx, cy, 0, 0)} Z"/>`;
 }
 
 const blend = (bg, ink, t) => '#' + [1, 3, 5].map(i => {

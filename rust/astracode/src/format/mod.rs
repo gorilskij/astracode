@@ -18,10 +18,12 @@
 //!   [`ring_radius`]`(k)` = 100 + 40k. Star 0 of every ring is at 12 o'clock
 //!   and the rest follow clockwise, so every ring has a star on each of the
 //!   six spokes at multiples of 60 degrees.
-//! * Every star is the same size and upright, never rotated: a regular
-//!   pentagram of outer radius [`STAR_RO`]. Its centre pentagon is always
-//!   solid ink. Each of its five limbs is either solid (bit 1) or a lighter
-//!   shade (bit 0). The top limb is bit 4 of the star's 5-bit *symbol*, then
+//! * Every star is the same size and upright, never rotated: a five-pointed
+//!   star of outer radius [`STAR_RO`]. It is drawn in the shape of the star in
+//!   the Astra Europa mark, a little fuller than a regular pentagram and with
+//!   rounded tips (see [`svg`]); the scanner matches a regular pentagram, and
+//!   reads either. Its centre pentagon is always solid ink. Each of its five
+//!   limbs is either solid (bit 1) or a lighter shade (bit 0). The top limb is bit 4 of the star's 5-bit *symbol*, then
 //!   clockwise bits 3, 2, 1, 0.
 //! * The centre may hold any picture, or nothing, inside a circle of radius
 //!   [`CENTER_R`]. Readers do not look at it. The band between that circle and
@@ -57,8 +59,9 @@ pub use payload::Payload;
 pub const R: f64 = 100.0;
 /// Outer radius of a star (centre to limb tip).
 pub const STAR_RO: f64 = 19.5;
-/// Inner radius of a star (centre to the notch between two limbs). A regular
-/// pentagram has inner/outer ratio sin 18 / sin 54.
+/// Inner radius of the star the scanner matches (centre to the notch between two
+/// limbs): that of a regular pentagram, whose inner/outer ratio is sin 18 / sin 54.
+/// Stars are drawn a little fuller than this; see [`svg::DRAWN_RATIO`].
 pub const STAR_RI: f64 = STAR_RO * 0.381_966_011_250_105_1;
 /// The centre picture must stay within this radius.
 pub const CENTER_R: f64 = 73.0;

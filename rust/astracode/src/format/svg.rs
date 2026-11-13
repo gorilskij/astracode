@@ -4,9 +4,15 @@
 //! edge, filled with the background colour. Light limbs are drawn first in a
 //! colour blended between background and ink, then the solid parts over them,
 //! then the centre picture.
+//!
+//! The stars are drawn in the shape of the star in the Astra Europa mark: a
+//! little fuller than a regular pentagram ([`DRAWN_RATIO`]), with the tips
+//! slightly rounded ([`TIP_ROUNDING`]). The scanner matches a regular
+//! pentagram and reads these just as well; a star's centre, its size and the
+//! directions of its limbs are the same in both.
 
-use super::geometry::{limb_polygon, limb_solid, star_center, star_polygon, Point};
-use super::{half_side, SHADE};
+use super::geometry::{limb_solid, star_center, Point};
+use super::{half_side, SHADE, STAR_RO};
 
 /// What to draw in the middle of the code. Readers ignore it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -57,9 +63,70 @@ fn blend(background: &str, ink: &str, t: f64) -> String {
     format!("#{:02x}{:02x}{:02x}", mix(1), mix(3), mix(5))
 }
 
-fn polygon(points: &[Point]) -> String {
-    let list: Vec<String> = points.iter().map(|p| format!("{:.3},{:.3}", p[0], p[1])).collect();
-    format!("<polygon points=\"{}\"/>", list.join(" "))
+/// Inner radius of a star as drawn, as a fraction of its outer radius: that of the
+/// star in the mark. (A regular pentagram has 0.382.)
+pub const DRAWN_RATIO: f64 = 0.4437;
+/// Radius of the arc that rounds each tip, as a fraction of the star's outer radius.
+pub const TIP_ROUNDING: f64 = 0.0256;
+
+/// The point `radius` from `center` in the direction `degrees` (clockwise from east, as SVG has it).
+fn at(center: Point, radius: f64, degrees: f64) -> Point {
+    let a = degrees.to_radians();
+    [center[0] + radius * a.cos(), center[1] + radius * a.sin()]
+}
+
+/// The notch before limb `k` of a star, going clockwise: where its outline is nearest the centre.
+fn notch(center: Point, k: usize) -> Point {
+    at(center, STAR_RO * DRAWN_RATIO, -90.0 - 36.0 + 72.0 * k as f64)
+}
+
+/// Path commands from the notch before limb `k` round its tip: a line to where the
+/// rounding arc leaves the first edge, and the arc to where it meets the second.
+fn tip(center: Point, k: usize) -> String {
+    let axis = -90.0 + 72.0 * k as f64;
+    let point = at(center, STAR_RO, axis);
+    let inner = STAR_RO * DRAWN_RATIO;
+    // Half the angle between the two edges that meet at the tip, and from it how far
+    // along each edge an arc tangent to both leaves it.
+    let half = (inner * 36f64.to_radians().sin()).atan2(STAR_RO - inner * 36f64.to_radians().cos());
+    let radius = TIP_ROUNDING * STAR_RO;
+    let cut = radius / half.tan();
+    let leave = |side: f64| {
+        let corner = at(center, inner, axis + side);
+        let length = (corner[0] - point[0]).hypot(corner[1] - point[1]);
+        [point[0] + (corner[0] - point[0]) * cut / length, point[1] + (corner[1] - point[1]) * cut / length]
+    };
+    let (a, b) = (leave(-36.0), leave(36.0));
+    format!("L{:.3},{:.3} A{radius:.3},{radius:.3} 0 0 1 {:.3},{:.3} ", a[0], a[1], b[0], b[1])
+}
+
+/// Limb `k` of a star centred on `center`, closed through the star's centre so that
+/// a light limb drawn first tucks under the solid core without a seam.
+fn limb_path(k: usize, center: Point) -> String {
+    let (from, to) = (notch(center, k), notch(center, (k + 1) % 5));
+    format!(
+        "<path d=\"M{:.3},{:.3} {}L{:.3},{:.3} L{:.3},{:.3} Z\"/>",
+        from[0],
+        from[1],
+        tip(center, k),
+        to[0],
+        to[1],
+        center[0],
+        center[1]
+    )
+}
+
+/// The solid part of a star with this symbol: the centre pentagon plus its solid limbs.
+fn solid_path(symbol: u8, center: Point) -> String {
+    let mut d = String::new();
+    for k in 0..5 {
+        let corner = notch(center, k);
+        d.push_str(&format!("{}{:.3},{:.3} ", if k == 0 { 'M' } else { 'L' }, corner[0], corner[1]));
+        if limb_solid(symbol, k) {
+            d.push_str(&tip(center, k));
+        }
+    }
+    format!("<path d=\"{d}Z\"/>")
 }
 
 /// A code as an SVG document, from the symbols of each ring as
@@ -71,9 +138,9 @@ pub fn svg(rings: &[Vec<u8>], style: &Style) -> String {
         for (i, &symbol) in symbols.iter().enumerate() {
             let center = star_center(i, ring);
             for k in (0..5).filter(|&k| !limb_solid(symbol, k)) {
-                light.push_str(&polygon(&limb_polygon(k, center)));
+                light.push_str(&limb_path(k, center));
             }
-            solid.push_str(&polygon(&star_polygon(symbol, center)));
+            solid.push_str(&solid_path(symbol, center));
         }
     }
     let picture = match style.centre {
@@ -114,7 +181,24 @@ mod tests {
         let symbols = vec![vec![31u8; 12], vec![0u8; 18]];
         let out = svg(&symbols, &Style { centre: Centre::Empty, ..Style::default() });
         // 30 solid parts, and five light limbs for each of the 18 all-light stars.
-        assert_eq!(out.matches("<polygon").count(), 30 + 18 * 5);
+        assert_eq!(out.matches("<path").count(), 30 + 18 * 5);
         assert!(out.contains("viewBox=\"-175.5 -175.5 351 351\""));
+    }
+
+    #[test]
+    fn stars_have_the_shape_of_the_star_in_the_mark() {
+        // Star 0 of ring 0, all limbs solid, is centred on (0, -100) with its first tip straight up.
+        let out = svg(&[vec![31u8; 12]], &Style { centre: Centre::Empty, ..Style::default() });
+        let first = out.split("<path d=\"").nth(1).expect("a star").split('"').next().expect("its outline");
+        // It starts at the notch before that tip: the inner radius, 36 degrees round from the tip.
+        let inner = STAR_RO * DRAWN_RATIO;
+        let (x, y) = (-inner * 36f64.to_radians().sin(), -100.0 - inner * 36f64.to_radians().cos());
+        assert!(first.starts_with(&format!("M{x:.3},{y:.3} ")), "{first}");
+        // Five rounded tips, and the arc at the top passes just short of the pentagram's sharp tip.
+        assert_eq!(first.matches(" A").count(), 5);
+        let arc: Vec<f64> = first.split(" A").nth(1).expect("an arc").split([' ', ',']).filter_map(|v| v.parse().ok()).collect();
+        let (radius, end) = (arc[0], [arc[5], arc[6]]);
+        assert!((radius - TIP_ROUNDING * STAR_RO).abs() < 1e-3);
+        assert!(end[0] > 0.0 && end[0] < 0.5 && end[1] > -100.0 - STAR_RO && end[1] < -100.0 - STAR_RO + 1.5, "{end:?}");
     }
 }

@@ -8,7 +8,12 @@ Layout
     radius 100 + RING_STEP * k, star 0 at 12 o'clock, then clockwise. Every
     ring has a star on each of the six spokes at multiples of 60 degrees.
   - Every star is the same size and upright (never rotated): a complete
-    regular pentagram. Its centre pentagon is always solid ink. Each of its
+    five-pointed star in the shape of the one in the Astra mark, a little
+    fuller than a regular pentagram (inner radius STAR_RATIO of the outer;
+    a regular one has 0.382) with its tips rounded by arcs of TIP_ROUNDING
+    of the outer radius. (The scanner matches a regular pentagram and reads
+    these just as well: centre, size and limb directions are the same.) Its
+    centre pentagon is always solid ink. Each of its
     five limbs is either solid (bit 1) or a lighter shade, SHADE of the way
     from background to ink (bit 0). The top limb is bit 4 of the star's 5-bit
     symbol, then clockwise bits 3, 2, 1, 0.
@@ -60,7 +65,8 @@ import math
 
 R = 100.0
 STAR_RO = 19.5
-STAR_RATIO = math.sin(math.radians(18)) / math.sin(math.radians(54))  # regular pentagram, 0.38197
+STAR_RATIO = 0.4437          # inner radius / outer radius: the star of the Astra mark
+TIP_ROUNDING = 0.0256        # radius of the arc rounding each tip / outer radius
 STAR_RI = STAR_RO * STAR_RATIO
 LOGO_D = 180.0
 CENTER_R = 73.0              # the centre picture must stay within this radius
@@ -523,26 +529,73 @@ def limb_solid(symbol, k):
     return bool((symbol >> (4 - k)) & 1)
 
 
+def _at(cx, cy, r, degrees):
+    a = math.radians(degrees)
+    return (cx + r * math.cos(a), cy + r * math.sin(a))
+
+
+def _tip(k, cx, cy, ro, ratio):
+    """Limb k's rounded tip: where the arc leaves one edge, where it meets the other, its
+    centre's distance from the star's centre, and half the angle it turns through (degrees)."""
+    axis = -90 + 72 * k
+    tip = _at(cx, cy, ro, axis)
+    # Half the angle between the two edges that meet at the tip.
+    half = math.atan2(ro * ratio * math.sin(math.radians(36)), ro - ro * ratio * math.cos(math.radians(36)))
+    r = TIP_ROUNDING * ro
+    ends = []
+    for side in (-36, 36):
+        notch = _at(cx, cy, ro * ratio, axis + side)
+        length = math.hypot(notch[0] - tip[0], notch[1] - tip[1])
+        cut = r / math.tan(half)                  # how far along the edge the arc leaves it
+        ends.append((tip[0] + (notch[0] - tip[0]) * cut / length, tip[1] + (notch[1] - tip[1]) * cut / length))
+    return ends[0], ends[1], ro - r / math.sin(half), 90 - math.degrees(half)
+
+
+def tip_points(k, cx=0.0, cy=0.0, ro=STAR_RO, ratio=STAR_RATIO, steps=4):
+    """Limb k's rounded tip as points along its arc, for drawing the star as a polygon."""
+    _, _, centre, sweep = _tip(k, cx, cy, ro, ratio)
+    axis = -90 + 72 * k
+    c = _at(cx, cy, centre, axis)
+    return [_at(c[0], c[1], TIP_ROUNDING * ro, axis - sweep + 2 * sweep * i / steps) for i in range(steps + 1)]
+
+
+def tip_path(k, cx=0.0, cy=0.0, ro=STAR_RO, ratio=STAR_RATIO):
+    """Limb k's rounded tip as SVG path commands: a line to the arc, and the arc."""
+    a, b, _, _ = _tip(k, cx, cy, ro, ratio)
+    r = TIP_ROUNDING * ro
+    return "L%.3f,%.3f A%.3f,%.3f 0 0 1 %.3f,%.3f " % (a[0], a[1], r, r, b[0], b[1])
+
+
 def limb_polygon(k, cx=0.0, cy=0.0):
-    """Limb k as a quadrilateral closed through the star centre, so it tucks under the core."""
-    pts = []
-    for a, r in ((-90 - 36 + 72 * k, STAR_RI), (-90 + 72 * k, STAR_RO), (-90 + 36 + 72 * k, STAR_RI)):
-        pts.append((cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a))))
-    pts.append((cx, cy))
-    return pts
+    """Limb k closed through the star centre, so it tucks under the core."""
+    return ([_at(cx, cy, STAR_RI, -90 - 36 + 72 * k)] + tip_points(k, cx, cy)
+            + [_at(cx, cy, STAR_RI, -90 + 36 + 72 * k), (cx, cy)])
 
 
 def star_polygon(symbol, cx=0.0, cy=0.0, ro=STAR_RO, ratio=STAR_RATIO):
     """Outline of the solid part of a star: the centre pentagon plus its solid limbs."""
-    ri = ro * ratio
     pts = []
     for k in range(5):
-        a = math.radians(-90 - 36 + 72 * k)
-        pts.append((cx + ri * math.cos(a), cy + ri * math.sin(a)))
+        pts.append(_at(cx, cy, ro * ratio, -90 - 36 + 72 * k))
         if limb_solid(symbol, k):
-            a = math.radians(-90 + 72 * k)
-            pts.append((cx + ro * math.cos(a), cy + ro * math.sin(a)))
+            pts += tip_points(k, cx, cy, ro, ratio)
     return pts
+
+
+def star_path(symbol, cx=0.0, cy=0.0, ro=STAR_RO, ratio=STAR_RATIO):
+    """The solid part of a star as an SVG path."""
+    d = ""
+    for k in range(5):
+        d += ("M" if k == 0 else "L") + "%.3f,%.3f " % _at(cx, cy, ro * ratio, -90 - 36 + 72 * k)
+        if limb_solid(symbol, k):
+            d += tip_path(k, cx, cy, ro, ratio)
+    return '<path d="%sZ"/>' % d
+
+
+def limb_path(k, cx=0.0, cy=0.0):
+    """Limb k as an SVG path, closed through the star centre."""
+    return '<path d="M%.3f,%.3f %sL%.3f,%.3f L%.3f,%.3f Z"/>' % (
+        *_at(cx, cy, STAR_RI, -90 - 36 + 72 * k), tip_path(k, cx, cy), *_at(cx, cy, STAR_RI, -90 + 36 + 72 * k), cx, cy)
 
 
 LOGO_SRC = 3840
@@ -564,13 +617,12 @@ def blend(background, ink, t):
 def svg_rings(ring_symbols, ink="#021639", background="#febc5c", size=512):
     """A code as an SVG string, from the symbols of each ring (see encode)."""
     half = half_side(len(ring_symbols))
-    poly = lambda pts: '<polygon points="%s"/>' % " ".join("%.3f,%.3f" % p for p in pts)
     light = solid = ""
     for ring, symbols in enumerate(ring_symbols):
         for i, sym in enumerate(symbols):
             cx, cy = star_center(i, ring)
-            light += "".join(poly(limb_polygon(k, cx, cy)) for k in range(5) if not limb_solid(sym, k))
-            solid += poly(star_polygon(sym, cx, cy))
+            light += "".join(limb_path(k, cx, cy) for k in range(5) if not limb_solid(sym, k))
+            solid += star_path(sym, cx, cy)
     k = LOGO_D / LOGO_SRC
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" '
