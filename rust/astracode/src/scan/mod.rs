@@ -125,12 +125,21 @@ pub(crate) struct Budget {
     gave_up: bool,
     /// Rings given the bent-surface treatment.
     bent: usize,
+    /// The frame offered so many loops of twelve that it must be full of texture or noise.
+    textured: bool,
 }
 
-/// Loops of twelve looked at per image plane before giving up.
-const MAX_LOOPS: usize = 600;
-/// Of those, how many may pass the first checks.
+/// Loops of twelve looked at in one pass (one binarised image, at one level of
+/// crowding) before moving on to the next. Each pass has its own allowance: a
+/// texture that fills one pass with chance loops must not keep the scanner
+/// from the pass that has the code's stars.
+const MAX_LOOPS: usize = 100;
+/// Loops per image plane that may pass the first checks, which is where the
+/// work starts, before giving up on the frame.
 const MAX_PLAUSIBLE: usize = 30;
+/// A plane that offers more loops than this in all is texture or noise, and
+/// its colour channels are not worth trying one by one.
+const TEXTURED_LOOPS: usize = 600;
 
 /// Scan one grey plane.
 fn scan_plane(gray: &Gray, options: &Options, budget: &mut Budget) -> Vec<Code> {
@@ -159,21 +168,27 @@ fn scan_plane(gray: &Gray, options: &Options, budget: &mut Budget) -> Vec<Code> 
 
     let mut results: Vec<Code> = Vec::new();
     let mut tried: Vec<candidate::Marks> = Vec::new();
-    let (mut loops, plausible_before) = (0usize, budget.plausible);
+    let (mut loops_in_all, plausible_before) = (0usize, budget.plausible);
     // First only blobs with few similar neighbours, which is quick and finds a code on
     // its own; then more crowded ones; last everything, which a code with several
     // rings needs, since all its stars are crowded.
     for max_crowd in [rings::CROWD, 2 * rings::CROWD, usize::MAX] {
         for (polarity, blobs, neighbourhood) in &passes {
             let view = View { image: gray, polarity: *polarity };
-            let mut finished = false;
+            let (mut loops, mut finished) = (0usize, false);
             rings::find_rings(neighbourhood, max_crowd, |ring| {
                 loops += 1;
-                if loops > MAX_LOOPS || budget.plausible - plausible_before > MAX_PLAUSIBLE {
+                loops_in_all += 1;
+                budget.textured |= loops_in_all > TEXTURED_LOOPS;
+                if budget.plausible - plausible_before > MAX_PLAUSIBLE {
                     budget.gave_up = true;
                 }
                 if budget.headers > 0 || budget.gave_up {
                     finished = true;
+                    return false;
+                }
+                if loops > MAX_LOOPS {
+                    // Texture or noise: leave it, the code's stars may be in another pass.
                     return false;
                 }
                 let centres: Vec<Point> = ring.blobs.iter().map(|&i| [blobs[i as usize].x / scale, blobs[i as usize].y / scale]).collect();
@@ -219,7 +234,7 @@ pub fn scan_rgb8(width: usize, height: usize, pixels: &[u8], options: &Options) 
     for channel in [2, 1, 0] {
         // If brightness showed a ring 0 whose outer rings could not be read, or a crowd of
         // stars with no readable ring among them, the single channels will not do better.
-        if budget.headers > 0 || budget.gave_up {
+        if budget.headers > 0 || budget.gave_up || budget.textured {
             break;
         }
         let results = scan_plane(&Gray::from_rgb8_channel(width, height, pixels, channel), options, &mut budget);

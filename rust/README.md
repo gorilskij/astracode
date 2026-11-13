@@ -122,6 +122,12 @@ Things worth knowing before changing it:
   returning nothing; the caller scans the next frame. Repairs are limited on
   purpose: one star in ring 0 (or two the reader already doubted), and the
   outer codeword always keeps two check symbols back for detection.
+* **The outer error correction is told what the reader doubts.** If the plain
+  repair fails, the least certain star pairs are treated as unknown, which
+  costs half as many check symbols each (`code::decode_outer_doubting`). This
+  does little against even noise, where the doubtful stars are right half the
+  time, and a lot against glare or anything covering part of a code, where
+  they are simply gone.
 * **Nothing depends on colour, on a particular light-limb shade, or on what is
   drawn in the centre.** The two shades are separated per photo by a small
   model (`limbs::classify`).
@@ -133,7 +139,13 @@ Things worth knowing before changing it:
   is carried in `View` next to the image.
 * **A frame has a budget** (`scan::Budget`): a code with many rings contains
   hundreds of loops of twelve stars that are not ring 0, so the search starts
-  where ring 0 would be and gives up after a fixed number of candidates.
+  where ring 0 would be and gives up after a fixed number of candidates. Each
+  pass of the search has its own allowance of loops, so that texture or noise
+  that fills one pass with chance loops does not keep the scanner from the
+  pass that has the code's stars.
+* **The star-finding threshold rises with the frame's noise**
+  (`blobs::noise_level`, measured in the flattest parts of the frame).
+  Otherwise noise itself becomes thousands of small blobs.
 
 ## Testing
 

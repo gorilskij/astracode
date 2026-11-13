@@ -167,6 +167,26 @@ pub fn decode(rings: &[Vec<u8>]) -> Option<(Payload, usize)> {
 /// As [`decode`], for a reader that has already made sense of ring 0.
 /// `outer_rings` are rings 1 and up; none for a one-ring code.
 pub fn decode_outer(header: &Header, outer_rings: &[Vec<u8>]) -> Option<(Payload, usize)> {
+    decode_outer_doubting(header, outer_rings, None)
+}
+
+/// Check symbols a reader keeps back for detection when it repairs with the
+/// help of its doubts ([`decode_outer_doubting`]): two for the smallest codes,
+/// which have only four, up to four where there are plenty.
+fn kept_back(checks: usize) -> usize {
+    (checks / 4).clamp(2, 4)
+}
+
+/// As [`decode_outer`], for a reader that knows how sure it is of each star.
+/// `confidence` has one value per star of the outer rings, in their order;
+/// larger is surer.
+///
+/// The plain repair is tried first. If the damage is beyond it, the least
+/// certain star pairs are treated as unknown, a few times over with more and
+/// more of them: an unknown pair costs one check symbol where a wrong one
+/// costs two, so a reader whose doubts are well placed can repair up to twice
+/// as much. Check symbols are still kept back for detection every time.
+pub fn decode_outer_doubting(header: &Header, outer_rings: &[Vec<u8>], confidence: Option<&[f64]>) -> Option<(Payload, usize)> {
     let (rings, level) = (header.rings, header.level);
     if outer_rings.len() != rings - 1 || outer_rings.iter().enumerate().any(|(k, r)| r.len() != ring_stars(k + 1)) {
         return None;
@@ -179,8 +199,34 @@ pub fn decode_outer(header: &Header, outer_rings: &[Vec<u8>]) -> Option<(Payload
         let mut codeword: Vec<u16> = covered(header.value).to_vec();
         codeword.extend(stars.chunks_exact(2).enumerate().map(|(j, pair)| ((pair[0] as u16) << 5 | pair[1] as u16) ^ whiten(j)));
         let checks = check_symbols(rings, level);
-        let fixed;
-        (fixed, repaired) = reed_solomon::correct_errors(gf1024(), &codeword, checks, max_repairs(rings, level))?;
+
+        // What to try: (pairs taken as unknown, least certain first; other pairs that may be wrong).
+        let mut attempts = vec![(0, max_repairs(rings, level))];
+        let mut doubted: Vec<usize> = Vec::new();
+        if let Some(confidence) = confidence.filter(|c| c.len() == stars.len()) {
+            let pair: Vec<f64> = confidence.chunks_exact(2).map(|c| c[0].min(c[1])).collect();
+            doubted = (0..pair.len()).collect();
+            doubted.sort_by(|&a, &b| pair[a].total_cmp(&pair[b]));
+            let budget = checks - kept_back(checks);
+            for quarter in 1..=4 {
+                let unknown = budget * quarter / 4;
+                if unknown > 0 && attempts.iter().all(|a| a.0 != unknown) {
+                    attempts.push((unknown, (budget - unknown) / 2));
+                }
+            }
+        }
+        let fixed = attempts.into_iter().find_map(|(unknown, wrong)| {
+            // The first four symbols are ring 0's value, which is not in doubt.
+            let erased: Vec<usize> = doubted[..unknown].iter().map(|&j| j + 4).collect();
+            reed_solomon::correct_errata(gf1024(), &codeword, checks, &erased, wrong)
+        });
+        let fixed = match fixed {
+            Some((fixed, changed)) => {
+                repaired = changed;
+                fixed
+            }
+            None => return None,
+        };
         // Ring 0's value is known, not read here; a "repair" to it means the outer rings belong to another code.
         if fixed[..4] != covered(header.value) {
             return None;
@@ -254,6 +300,39 @@ mod tests {
         bad[5][40] ^= 1;
         assert!(decode(&bad).is_none_or(|(p, _)| p == payload));
         assert_eq!(max_repairs(1, 0), 0);
+    }
+
+    #[test]
+    fn a_reader_with_well_placed_doubts_repairs_more() {
+        // Five rings at level 1: 54 star pairs, 14 of them check symbols, 6 repaired plainly.
+        let (rings, level) = (5, 1);
+        let payload = bytes(capacity(rings, level));
+        let good = encode_with_rings(&payload, level, rings).unwrap();
+        let header = ring0::read(&good[0].as_slice().try_into().unwrap(), None).unwrap();
+        assert_eq!((check_symbols(rings, level), max_repairs(rings, level)), (14, 6));
+        // Spoil the first `count` pairs of ring 4, and say how sure the reader is of each star.
+        let spoilt = |count: usize| {
+            let mut bad = good[1..].to_vec();
+            for pair in 0..count {
+                bad[3][2 * pair] ^= 21;
+            }
+            bad
+        };
+        let stars: usize = (1..rings).map(ring_stars).sum();
+        let first_of_ring_4 = stars - ring_stars(4);
+        let doubts = |from: usize, pairs: usize| -> Vec<f64> {
+            (0..stars).map(|i| if (from..from + 2 * pairs).contains(&i) { 0.1 } else { 0.9 }).collect()
+        };
+
+        // Ten spoilt pairs: too many, unless the reader doubts the right ones.
+        assert_eq!(decode_outer(&header, &spoilt(10)), None);
+        assert_eq!(decode_outer_doubting(&header, &spoilt(10), Some(&doubts(first_of_ring_4, 10))), Some((payload.clone(), 10)));
+        // Doubts in the wrong place do not help, and do not lead to a wrong payload either.
+        assert_eq!(decode_outer_doubting(&header, &spoilt(10), Some(&doubts(0, 10))), None);
+        // Twelve are too many even so: three check symbols are kept back.
+        assert_eq!(decode_outer_doubting(&header, &spoilt(12), Some(&doubts(first_of_ring_4, 12))), None);
+        // Within the plain limit, doubts change nothing.
+        assert_eq!(decode_outer_doubting(&header, &spoilt(6), Some(&doubts(0, 10))), Some((payload, 6)));
     }
 
     #[test]

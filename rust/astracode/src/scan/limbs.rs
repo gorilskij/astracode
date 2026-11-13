@@ -52,18 +52,30 @@ pub(crate) fn contrast(levels: &Levels, polarity: f64) -> Vec<f64> {
 /// Each limb is compared with the background on its own two sides, so a shadow
 /// edge or light gradient across a star cancels out; the star's always-solid
 /// centre sets the scale.
+///
+/// With dark ink on a light background, the background beside a limb also says
+/// how much light falls there, and that is divided out limb by limb. With light
+/// ink on a dark background it says nothing of the kind: it is a small number,
+/// mostly noise and stray light, and dividing by it would turn a little noise
+/// in the dark into a large error. There the limb is simply measured against
+/// the star's centre, and uneven light is left to [`classify`]'s model.
 pub(crate) fn limb_strength(levels: &Levels, polarity: f64) -> Vec<[f64; 5]> {
     const EPS: f64 = 8.0;
     (0..levels.core.len())
         .map(|i| {
             let (core, limb, gap) = (levels.core[i], &levels.limb[i], &levels.gap[i]);
             let background = median(gap);
-            // The core's contrast, with the local light level divided out.
-            let scale = (polarity * (background - core) / (background + EPS)).max(1e-3);
-            std::array::from_fn(|k| {
-                let flank = 0.5 * (gap[k] + gap[(k + 4) % 5]);
-                polarity * (flank - limb[k]) / (flank + EPS) / scale
-            })
+            if polarity > 0.0 {
+                // The core's contrast, with the local light level divided out.
+                let scale = ((background - core) / (background + EPS)).max(1e-3);
+                std::array::from_fn(|k| {
+                    let flank = 0.5 * (gap[k] + gap[(k + 4) % 5]);
+                    (flank - limb[k]) / (flank + EPS) / scale
+                })
+            } else {
+                let scale = (core - background).max(1e-3);
+                std::array::from_fn(|k| (limb[k] - 0.5 * (gap[k] + gap[(k + 4) % 5])) / scale)
+            }
         })
         .collect()
 }
@@ -302,6 +314,32 @@ mod tests {
             assert!((reading.separation - separation).abs() < 0.02, "separation {} at level {level}", reading.separation);
             if level < 0.8 {
                 assert_eq!(reading.symbols(), symbols, "light level {level}");
+            }
+        }
+    }
+
+    #[test]
+    fn light_on_dark_is_measured_as_steadily_as_dark_on_light() {
+        // One star: solid centre, limbs alternately solid and 70% light, on a background 177 levels away.
+        let star = |background: f64, ink: f64, wobble: f64| Levels {
+            core: vec![ink],
+            limb: vec![std::array::from_fn(|k| if k % 2 == 0 { ink } else { background + 0.7 * (ink - background) })],
+            // The background beside each limb is off by a few grey levels, as noise makes it.
+            gap: vec![std::array::from_fn(|k| background + wobble * [1.0, -1.0, 0.5, -0.5, 0.0][k])],
+        };
+        let dark_on_light = limb_strength(&star(197.0, 20.0, 0.0), 1.0)[0];
+        let light_on_dark = limb_strength(&star(20.0, 197.0, 0.0), -1.0)[0];
+        for k in 0..5 {
+            let expected = if k % 2 == 0 { 1.0 } else { 0.7 };
+            assert!((dark_on_light[k] - expected).abs() < 0.02 && (light_on_dark[k] - expected).abs() < 1e-9);
+        }
+        // Six grey levels of noise in the background move a limb's strength by a few percent
+        // in either polarity, not by a third as dividing by a dark background would.
+        for (levels, polarity) in [(star(197.0, 20.0, 6.0), 1.0), (star(20.0, 197.0, 6.0), -1.0)] {
+            let noisy = limb_strength(&levels, polarity)[0];
+            for k in 0..5 {
+                let expected = if k % 2 == 0 { 1.0 } else { 0.7 };
+                assert!((noisy[k] - expected).abs() < 0.06, "limb {k}: {} with polarity {polarity}", noisy[k]);
             }
         }
     }

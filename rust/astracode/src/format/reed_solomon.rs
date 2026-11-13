@@ -13,7 +13,8 @@
 //!   [`fill_two`].
 //! * The outer rings form one long codeword and get a general
 //!   Berlekamp-Massey decoder, [`correct_errors`], with an explicit limit on
-//!   how many symbols it may repair.
+//!   how many symbols it may repair, and [`correct_errata`], the same for a
+//!   reader that can say which symbols it is unsure of.
 
 use super::gf::Field;
 
@@ -127,33 +128,19 @@ fn eval(field: &Field, poly: &[u16], x: u16) -> u16 {
     value
 }
 
-/// Repair up to `max_errors` wrong symbols anywhere in the codeword
-/// (Berlekamp-Massey, Chien search, Forney).
-///
-/// `max_errors` may be at most `checks / 2`. Asking for fewer leaves check
-/// symbols over for detection, which is what keeps a badly misread codeword
-/// from being turned into a different valid one. Returns the repaired codeword
-/// and the number of symbols changed, or `None` if it cannot be repaired
-/// within the limit.
-pub fn correct_errors(field: &Field, codeword: &[u16], checks: usize, max_errors: usize) -> Option<(Vec<u16>, usize)> {
-    let n = codeword.len();
-    let synd = syndromes(field, codeword, checks);
-    if synd.iter().all(|&x| x == 0) {
-        return Some((codeword.to_vec(), 0));
-    }
-
-    // Berlekamp-Massey: the shortest recurrence that generates the syndromes.
-    // `loc` is the error locator polynomial, lowest degree first.
+/// Berlekamp-Massey: the shortest recurrence that generates `sequence`, as a
+/// polynomial lowest degree first, with its length.
+fn shortest_recurrence(field: &Field, sequence: &[u16]) -> (Vec<u16>, usize) {
     let mut loc = vec![1u16];
     let mut prev = vec![1u16];
     let mut shift = 1usize;
     let mut last = 1u16;
     let mut errs = 0usize;
-    for i in 0..checks {
-        let mut delta = synd[i];
+    for i in 0..sequence.len() {
+        let mut delta = sequence[i];
         for j in 1..=errs {
             if j < loc.len() {
-                delta ^= field.mul(loc[j], synd[i - j]);
+                delta ^= field.mul(loc[j], sequence[i - j]);
             }
         }
         if delta == 0 {
@@ -181,13 +168,69 @@ pub fn correct_errors(field: &Field, codeword: &[u16], checks: usize, max_errors
     while loc.last() == Some(&0) {
         loc.pop();
     }
-    if loc.len() != errs + 1 || errs > max_errors.min(checks / 2) {
+    (loc, errs)
+}
+
+/// Repair up to `max_errors` wrong symbols anywhere in the codeword
+/// (Berlekamp-Massey, Chien search, Forney).
+///
+/// `max_errors` may be at most `checks / 2`. Asking for fewer leaves check
+/// symbols over for detection, which is what keeps a badly misread codeword
+/// from being turned into a different valid one. Returns the repaired codeword
+/// and the number of symbols changed, or `None` if it cannot be repaired
+/// within the limit.
+pub fn correct_errors(field: &Field, codeword: &[u16], checks: usize, max_errors: usize) -> Option<(Vec<u16>, usize)> {
+    correct_errata(field, codeword, checks, &[], max_errors)
+}
+
+/// As [`correct_errors`], for a reader that doubts some symbols to begin with:
+/// the symbols at the indices `erased` count as unknown, and up to
+/// `max_errors` of the others may be wrong.
+///
+/// An unknown symbol costs one check symbol to rebuild and a wrong one costs
+/// two, so `erased.len() + 2 * max_errors` may be at most `checks`; whatever
+/// is left over is what detects a codeword too damaged to repair. Returns the
+/// repaired codeword and the number of symbols changed.
+pub fn correct_errata(field: &Field, codeword: &[u16], checks: usize, erased: &[usize], max_errors: usize) -> Option<(Vec<u16>, usize)> {
+    let n = codeword.len();
+    let synd = syndromes(field, codeword, checks);
+    if synd.iter().all(|&x| x == 0) {
+        return Some((codeword.to_vec(), 0));
+    }
+    let unknown = erased.len();
+    if unknown > checks || n > field.order() || erased.iter().any(|&i| i >= n) {
         return None;
     }
+    let max_errors = max_errors.min((checks - unknown) / 2);
 
-    // Error evaluator: syndromes(x) * loc(x) mod x^checks.
+    // The locator of the unknown symbols: the product of (1 + X x) over their places X.
+    let mut known_places = vec![1u16];
+    for &index in erased {
+        let place = field.alpha(n - 1 - index);
+        known_places.push(0);
+        for j in (1..known_places.len()).rev() {
+            known_places[j] ^= field.mul(known_places[j - 1], place);
+        }
+    }
+    // With the unknown symbols' part taken out of the syndromes, what is left obeys the
+    // recurrence of the wrong symbols alone.
+    let rest: Vec<u16> =
+        (unknown..checks).map(|i| known_places.iter().enumerate().fold(0, |sum, (j, &g)| sum ^ field.mul(g, synd[i - j]))).collect();
+    let (wrong_places, errs) = shortest_recurrence(field, &rest);
+    if wrong_places.len() != errs + 1 || errs > max_errors {
+        return None;
+    }
+    // Both kinds together.
+    let mut loc = vec![0u16; known_places.len() + wrong_places.len() - 1];
+    for (i, &a) in known_places.iter().enumerate() {
+        for (j, &b) in wrong_places.iter().enumerate() {
+            loc[i + j] ^= field.mul(a, b);
+        }
+    }
+
+    // Evaluator: syndromes(x) * loc(x) mod x^checks.
     let mut omega = vec![0u16; checks];
-    for (i, &a) in loc.iter().enumerate() {
+    for (i, &a) in loc.iter().enumerate().take(checks) {
         for j in 0..checks - i {
             omega[i + j] ^= field.mul(a, synd[j]);
         }
@@ -211,8 +254,12 @@ pub fn correct_errors(field: &Field, codeword: &[u16], checks: usize, max_errors
         found += 1;
     }
     // Fewer roots than the locator's degree means the errors are not where a
-    // codeword of this length could have them.
-    (found == errs).then_some((fixed, errs))
+    // codeword of this length could have them (or a symbol was named unknown twice).
+    if found != errs + unknown || syndromes(field, &fixed, checks).iter().any(|&x| x != 0) {
+        return None;
+    }
+    let changed = fixed.iter().zip(codeword).filter(|(a, b)| a != b).count();
+    Some((fixed, changed))
 }
 
 #[cfg(test)]
@@ -264,5 +311,35 @@ mod tests {
         assert_eq!(correct_errors(f, &cw, 10, 4), None);
         cw[49] ^= 1;
         assert_ne!(correct_errors(f, &cw, 10, 5).map(|r| r.0), Some(good));
+    }
+
+    #[test]
+    fn symbols_known_to_be_doubtful_cost_half_as_much() {
+        let f = gf1024();
+        let data: Vec<u16> = (0..40).map(|i| (i * 53 + 9) % 1024).collect();
+        let good = codeword(f, &data, 10);
+        // Eight wrong symbols are beyond ten check symbols, unless the reader knows which.
+        let wrong = [0usize, 5, 12, 19, 26, 33, 41, 49];
+        let mut cw = good.clone();
+        for (k, &at) in wrong.iter().enumerate() {
+            cw[at] ^= 300 + k as u16;
+        }
+        assert_ne!(correct_errors(f, &cw, 10, 5).map(|r| r.0), Some(good.clone()));
+        assert_eq!(correct_errata(f, &cw, 10, &wrong, 0), Some((good.clone(), 8)));
+        // Doubting a symbol that was right costs a check symbol and changes nothing:
+        // six doubted, of which four wrong, and two more wrong elsewhere.
+        let mut cw = good.clone();
+        for at in [5usize, 12, 19, 26, 44, 47] {
+            cw[at] ^= 77;
+        }
+        assert_eq!(correct_errata(f, &cw, 10, &[5, 12, 19, 26, 30, 31], 2), Some((good.clone(), 6)));
+        // One more wrong symbol than that is refused, as is a limit lower than the damage.
+        assert_eq!(correct_errata(f, &cw, 10, &[5, 12, 19, 26, 30, 31], 1), None);
+        cw[1] ^= 3;
+        assert_eq!(correct_errata(f, &cw, 10, &[5, 12, 19, 26, 30, 31], 2), None);
+        // Nothing doubted is the plain decoder.
+        let mut cw = good.clone();
+        cw[7] ^= 1;
+        assert_eq!(correct_errata(f, &cw, 10, &[], 5), Some((good, 1)));
     }
 }

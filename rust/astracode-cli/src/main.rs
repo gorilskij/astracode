@@ -15,8 +15,10 @@ use std::time::Instant;
 use astracode::astra::Number;
 use astracode::format::code;
 use astracode::format::svg::{svg, Centre, Style};
-use astracode::scan::{scan_rgb8, Code, Options, Payload};
+use astracode::image::Gray;
+use astracode::scan::{scan_gray, scan_rgb8, Code, Options, Payload};
 use clap::{Args, Parser, Subcommand};
+use rayon::prelude::*;
 
 #[derive(Parser)]
 #[command(name = "astracode", version, about = "Make and scan Astracodes")]
@@ -48,6 +50,8 @@ enum Command {
         list: PathBuf,
         #[command(flatten)]
         scanning: Scanning,
+        #[command(flatten)]
+        damage: Damage,
     },
     /// Draw a code holding text or bytes. It gets as many rings as that needs:
     /// one ring holds four bytes.
@@ -87,6 +91,73 @@ struct Scanning {
     /// Faster on big frames, but misses small stars.
     #[arg(long)]
     find_size: Option<usize>,
+}
+
+/// Ways for `batch` to spoil each image before scanning it, for experiments
+/// that sweep one kind of damage over the same clean frames. Any of them makes
+/// the scan work on brightness alone, as a camera preview does.
+#[derive(Args)]
+struct Damage {
+    /// Scan the image's brightness only, without falling back to single colour channels.
+    #[arg(long)]
+    gray: bool,
+    /// Swap dark and light: each pixel becomes darkest + lightest - itself, which
+    /// turns dark ink on a light background into the same code light on dark.
+    #[arg(long)]
+    invert: bool,
+    /// Add Gaussian noise of this standard deviation, in grey levels of 0 to 255.
+    #[arg(long, default_value_t = 0.0)]
+    noise: f64,
+    /// Seed for the noise. The same seed gives the same noise for the same file name.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+}
+
+impl Damage {
+    fn any(&self) -> bool {
+        self.gray || self.invert || self.noise > 0.0
+    }
+
+    /// The image's brightness plane, spoiled as asked, as 8-bit pixels.
+    fn apply(&self, image: &image::RgbImage, path: &str) -> Vec<u8> {
+        let mut gray: Vec<u8> = image
+            .as_raw()
+            .chunks_exact(3)
+            .map(|p| ((p[0] as u32 * 4899 + p[1] as u32 * 9617 + p[2] as u32 * 1868 + 8192) >> 14) as u8)
+            .collect();
+        if self.invert {
+            let (darkest, lightest) = gray.iter().fold((255u8, 0u8), |(lo, hi), &g| (lo.min(g), hi.max(g)));
+            for g in &mut gray {
+                *g = darkest + lightest - *g;
+            }
+        }
+        if self.noise > 0.0 {
+            // One generator per row, seeded from the file's name, the seed and the row, so that rows can
+            // be done in parallel and a run can be repeated.
+            let name = Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let base = name.bytes().fold(self.seed ^ 0x9E37_79B9_7F4A_7C15, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3));
+            let width = image.width() as usize;
+            gray.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+                let mut state = base ^ (y as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+                let mut uniform = || {
+                    // splitmix64, as a number in (0, 1].
+                    state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                    let mut z = state;
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                    (((z ^ (z >> 31)) >> 11) as f64 + 1.0) / (1u64 << 53) as f64
+                };
+                for pair in row.chunks_mut(2) {
+                    // Box-Muller: two uniform numbers give two independent normal ones.
+                    let (radius, angle) = ((-2.0 * uniform().ln()).sqrt(), std::f64::consts::TAU * uniform());
+                    for (g, normal) in pair.iter_mut().zip([radius * angle.cos(), radius * angle.sin()]) {
+                        *g = (*g as f64 + self.noise * normal).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+            });
+        }
+        gray
+    }
 }
 
 #[derive(Args)]
@@ -180,12 +251,17 @@ fn scan(images: &[PathBuf], options: &Options, time: bool, repeat: u32) -> Resul
     Ok(())
 }
 
-fn batch(list: &Path, options: &Options) -> Result<(), String> {
+fn batch(list: &Path, options: &Options, damage: &Damage) -> Result<(), String> {
     let text = std::fs::read_to_string(list).map_err(|e| format!("{}: {e}", list.display()))?;
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let image = load(Path::new(line))?;
+        let (width, height) = (image.width() as usize, image.height() as usize);
+        let gray = damage.any().then(|| Gray::from_luma8(width, height, &damage.apply(&image, line)));
         let start = Instant::now();
-        let codes = scan_rgb8(image.width() as usize, image.height() as usize, image.as_raw(), options);
+        let codes = match &gray {
+            Some(gray) => scan_gray(gray, options),
+            None => scan_rgb8(width, height, image.as_raw(), options),
+        };
         let took = start.elapsed().as_secs_f64();
         let mut fields = vec![line.to_string(), format!("{took:.6}")];
         for code in &codes {
@@ -237,7 +313,7 @@ fn options(scanning: &Scanning) -> Result<Options, String> {
 fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Scan { images, scanning, time, repeat } => scan(&images, &options(&scanning)?, time, repeat),
-        Command::Batch { list, scanning } => batch(&list, &options(&scanning)?),
+        Command::Batch { list, scanning, damage } => batch(&list, &options(&scanning)?, &damage),
         Command::Encode { data, hex, level, rings, drawing } => {
             let bytes = if hex { unhex(&data)? } else { data.into_bytes() };
             let payload = Payload::from_bytes(bytes);

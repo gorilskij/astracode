@@ -270,7 +270,11 @@ pub(crate) fn read_rings(
             outer_rings.push(symbols[at..at + ring_stars(k)].to_vec());
             at += ring_stars(k);
         }
-        let Some((payload, repaired)) = code::decode_outer(header, &outer_rings) else { continue };
+        // The reading's doubts tell the error correction where to look first.
+        let confidence = reading.star_confidence();
+        let Some((payload, repaired)) = code::decode_outer_doubting(header, &outer_rings, Some(&confidence[12..])) else {
+            continue;
+        };
         let half = half_side(rings);
         return Some(Code {
             payload,
