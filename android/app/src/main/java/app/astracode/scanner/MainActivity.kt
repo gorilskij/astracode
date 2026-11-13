@@ -35,7 +35,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
 import java.util.concurrent.Executors
-import kotlin.math.max
+import kotlin.math.min
 
 /**
  * Live scanner. Every camera frame goes to the native scanner. When a code is accepted,
@@ -87,6 +87,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         preview = findViewById(R.id.preview)
+        // Show the whole frame, as a camera app does, not a crop that fills the screen:
+        // what is on screen is then exactly what the scanner is given, so a code can be
+        // kept out of a scan by keeping it out of view.
+        preview.scaleType = PreviewView.ScaleType.FIT_CENTER
         overlay = findViewById(R.id.overlay)
         top = findViewById(R.id.top)
         hint = findViewById(R.id.hint)
@@ -205,11 +209,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** A code's outline from frame pixels to view pixels: the frame turned upright, then centre-cropped to fill the preview. */
+    /** A code's outline from frame pixels to view pixels: the frame turned upright, then fitted whole into the preview. */
     private fun toView(corners: FloatArray, w: Int, h: Int, rotation: Int): FloatArray {
         val uprightW = if (rotation % 180 == 0) w else h
         val uprightH = if (rotation % 180 == 0) h else w
-        val scale = max(preview.width / uprightW.toFloat(), preview.height / uprightH.toFloat())
+        val scale = min(preview.width / uprightW.toFloat(), preview.height / uprightH.toFloat())
         val dx = (preview.width - uprightW * scale) / 2
         val dy = (preview.height - uprightH * scale) / 2
         val out = FloatArray(corners.size)
