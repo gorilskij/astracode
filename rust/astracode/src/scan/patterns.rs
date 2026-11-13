@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use crate::format::geometry::{inside, ring_centers, star_polygon};
 use crate::format::{CENTER_R, MARGIN, MAX_RINGS, R, STAR_RI, STAR_RO};
 use crate::image::Gray;
-use crate::math::{add, offset, Homography, LocalMap, Point};
+use crate::math::{Homography, LocalMap, Point};
 
 /// The thinned outline keeps every this-many-th point.
 pub(crate) const THIN: usize = 3;
@@ -31,10 +31,11 @@ pub(crate) struct Patterns {
     /// outside it, each group summing to 1. The weighted sum of image levels is
     /// "mean outside minus mean inside" up to sign: large when a star sits here.
     pub weights: Vec<f32>,
-    /// Every third point of the grid with its weight, for when there are
-    /// hundreds of stars to match and a rougher answer will do.
-    pub grid_thin: Vec<Point>,
-    pub weights_thin: Vec<f32>,
+    /// The grid's points as `(x, y, weight)` in single precision, for [`outline_local`]:
+    /// all of them, and every third, for when there are hundreds of stars to match and a
+    /// rougher answer will do.
+    outline: Vec<[f32; 3]>,
+    outline_thin: Vec<[f32; 3]>,
     /// Offsets tried when re-locating a star near where a flat fit puts it.
     pub search: Vec<Point>,
     /// The same, wider, for a surface that bends.
@@ -115,11 +116,12 @@ fn build() -> Patterns {
 
     let weights: Vec<f32> = weights;
     let near = [-6.0, -3.0, 0.0, 3.0, 6.0];
+    let outline: Vec<[f32; 3]> = grid.iter().zip(&weights).map(|(g, &w)| [g[0] as f32, g[1] as f32, w]).collect();
     Patterns {
+        outline_thin: outline.iter().step_by(THIN).copied().collect(),
+        outline,
         core,
         star,
-        grid_thin: grid.iter().step_by(THIN).copied().collect(),
-        weights_thin: weights.iter().step_by(THIN).copied().collect(),
         grid,
         weights,
         search: square_grid(4.0, 1.0),
@@ -154,13 +156,22 @@ pub(crate) fn outline_flat(image: &Gray, h: &Homography, at: Point, scale: f64) 
 /// map. With `thin`, only every third outline point is used.
 pub(crate) fn outline_local(image: &Gray, pos: Point, map: &LocalMap, thin: bool) -> f64 {
     let p = patterns();
-    let (grid, weights) = if thin { (&p.grid_thin, &p.weights_thin) } else { (&p.grid, &p.weights) };
-    let mut sum = 0.0f32;
-    for (g, w) in grid.iter().zip(weights) {
-        let q = add(pos, offset(map, *g));
-        sum += w * image.sample(q[0], q[1]);
+    let points = if thin { &p.outline_thin } else { &p.outline };
+    // Single precision places a point to a ten-thousandth of a pixel, which is plenty, and
+    // four running sums do not have to wait for each other's additions: this is what
+    // fitting the shape of every star of a big code spends its time on.
+    let (px, py) = (pos[0] as f32, pos[1] as f32);
+    let (xx, xy, yx, yy) = (map[(0, 0)] as f32, map[(0, 1)] as f32, map[(1, 0)] as f32, map[(1, 1)] as f32);
+    let level = |g: &[f32; 3]| g[2] * image.sample_near(px + xx * g[0] + xy * g[1], py + yx * g[0] + yy * g[1]);
+    let mut sums = [0.0f32; 4];
+    let mut fours = points.chunks_exact(4);
+    for four in &mut fours {
+        for (sum, g) in sums.iter_mut().zip(four) {
+            *sum += level(g);
+        }
     }
-    -sum as f64
+    let rest: f32 = fours.remainder().iter().map(level).sum();
+    -(((sums[0] + sums[1]) + (sums[2] + sums[3])) + rest) as f64
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@
 //! and shape becomes a [`Blob`]. How far from the mean a pixel must be rises
 //! with the image's noise ([`noise_level`]), so that noise does not become blobs.
 
-use crate::image::Gray;
+use crate::image::{reflect, Gray};
 
 /// A connected region of the binarised image: possibly a star.
 #[derive(Debug, Clone, Copy)]
@@ -23,13 +23,14 @@ const MAX_BLOBS: usize = 3500;
 /// Smallest blob worth considering, in pixels.
 const MIN_AREA: f64 = 9.0;
 
-/// Connected regions (8-connectivity) of the pixels where `ink` is true, kept
-/// if they could be a star: not tiny, not huge, not a line, not a hollow frame.
+/// Connected regions (8-connectivity) of the pixels that have `bit` set in
+/// `ink`, kept if they could be a star: not tiny, not huge, not a line, not a
+/// hollow frame.
 ///
 /// Works on runs of ink along each row rather than on single pixels: a run
 /// joins every run of the row above that it touches, and a region's size,
 /// centroid and bounding box are summed run by run. No label image is needed.
-pub(crate) fn find_blobs(width: usize, height: usize, ink: &[bool], max_area: f64) -> Vec<Blob> {
+pub(crate) fn find_blobs(width: usize, height: usize, ink: &[u8], bit: u8, max_area: f64) -> Vec<Blob> {
     #[derive(Clone, Copy)]
     struct Stats {
         area: f64,
@@ -59,18 +60,25 @@ pub(crate) fn find_blobs(width: usize, height: usize, ink: &[bool], max_area: f6
     let mut parent: Vec<u32> = Vec::new();
     let mut stats: Vec<Stats> = Vec::new();
     let (mut above, mut here): (Vec<Run>, Vec<Run>) = (Vec::new(), Vec::new());
+    let sixteen = u128::from_ne_bytes([bit; 16]);
     for y in 0..height {
         let row = &ink[y * width..(y + 1) * width];
         here.clear();
         let mut first = 0; // the first run above that could still touch a run in this row
         let mut x = 0;
         while x < width {
-            if !row[x] {
-                x += 1;
+            if row[x] & bit == 0 {
+                // Most of an image is not ink: step over it sixteen pixels at a time.
+                while x + 16 <= width && u128::from_ne_bytes(row[x..x + 16].try_into().expect("sixteen bytes")) & sixteen == 0 {
+                    x += 16;
+                }
+                while x < width && row[x] & bit == 0 {
+                    x += 1;
+                }
                 continue;
             }
             let start = x as u32;
-            while x < width && row[x] {
+            while x < width && row[x] & bit != 0 {
                 x += 1;
             }
             let end = x as u32;
@@ -170,34 +178,137 @@ pub(crate) fn noise_level(image: &Gray) -> f32 {
     (*level / 6.0).sqrt()
 }
 
+/// Pixels of one side of a cell: local means are worked out for cells of this many
+/// pixels square, not for every pixel. A mean over dozens of pixels changes too
+/// slowly from one pixel to the next for that to matter.
+const CELL: usize = 4;
+
+/// A pixel is ink when it differs from its local mean by more than this many levels,
+const CONTRAST: f32 = 7.0;
+/// or, in a noisy image, by this many times what is left of the noise after smoothing;
+/// otherwise the noise itself turns into thousands of blobs.
+const NOISE_CLEARANCE: f32 = 3.0;
+/// What the smoothing of [`smooth_row`] leaves of independent pixel noise.
+const SMOOTHED: f32 = 0.273;
+
+/// Row `y` of the image, smoothed to take the edge off pixel noise: weights
+/// 1 4 6 4 1 down and then across, which is close to a Gaussian blur of radius 1.
+/// `column` is working space, a row long.
+fn smooth_row(image: &Gray, y: usize, column: &mut [f32], out: &mut [f32]) {
+    let (w, h) = (image.width, image.height);
+    let row = |dy: isize| {
+        let y = reflect(y as isize + dy, h);
+        &image.data[y * w..(y + 1) * w]
+    };
+    let (a, b, c, d, e) = (row(-2), row(-1), row(0), row(1), row(2));
+    for x in 0..w {
+        column[x] = (a[x] + e[x]) + 4.0 * (b[x] + d[x]) + 6.0 * c[x];
+    }
+    let column = &*column;
+    let across = |x: usize| {
+        let at = |dx: isize| column[reflect(x as isize + dx, w)];
+        ((at(-2) + at(2)) + 4.0 * (at(-1) + at(1)) + 6.0 * at(0)) / 256.0
+    };
+    if w < 5 {
+        (0..w).for_each(|x| out[x] = across(x));
+        return;
+    }
+    for (o, five) in out[2..w - 2].iter_mut().zip(column.windows(5)) {
+        *o = ((five[0] + five[4]) + 4.0 * (five[1] + five[3]) + 6.0 * five[2]) / 256.0;
+    }
+    for x in [0, 1, w - 2, w - 1] {
+        out[x] = across(x);
+    }
+}
+
+/// Row `y` of the full image's local means, from the means worked out per cell:
+/// interpolated between the cell centres, down and then across. `cells_row` is
+/// working space, as long as a row of cells.
+fn mean_row(means: &Gray, y: usize, cells_row: &mut [f32], out: &mut [f32]) {
+    // Where a pixel is in units of cells, measured from the centre of the first cell.
+    let place = |pixel: usize| ((pixel as f32 + 0.5) / CELL as f32 - 0.5).max(0.0);
+    let (cw, ch) = (means.width, means.height);
+    let fy = place(y);
+    let (r0, t) = ((fy as usize).min(ch - 1), fy - fy.floor());
+    let r1 = (r0 + 1).min(ch - 1);
+    let (top, bottom) = (&means.data[r0 * cw..(r0 + 1) * cw], &means.data[r1 * cw..(r1 + 1) * cw]);
+    for ((o, a), b) in cells_row.iter_mut().zip(top).zip(bottom) {
+        *o = a * (1.0 - t) + b * t;
+    }
+    let cells_row = &*cells_row;
+    let at = |x: usize| {
+        let fx = place(x);
+        let (c0, t) = ((fx as usize).min(cw - 1), fx - fx.floor());
+        cells_row[c0] * (1.0 - t) + cells_row[(c0 + 1).min(cw - 1)] * t
+    };
+    // Away from the ends, each cell's pixels lie between its own centre and a neighbour's:
+    // the first half lean on the cell to the left, the second half on the cell to the right.
+    let lean: [f32; CELL] = std::array::from_fn(|p| (p as f32 + 0.5) / CELL as f32 - 0.5);
+    let whole = (out.len() / CELL).min(cw);
+    for c in 1..whole.saturating_sub(1) {
+        let (left, mid, right) = (cells_row[c - 1], cells_row[c], cells_row[c + 1]);
+        for (p, o) in out[c * CELL..(c + 1) * CELL].iter_mut().enumerate() {
+            *o = if lean[p] < 0.0 { mid + (left - mid) * -lean[p] } else { mid + (right - mid) * lean[p] };
+        }
+    }
+    let ends = if whole > 2 { (0..CELL).chain((whole - 1) * CELL..out.len()) } else { (0..0).chain(0..out.len()) };
+    for x in ends {
+        out[x] = at(x);
+    }
+}
+
 /// The blobs of one image, for both polarities and two neighbourhood sizes.
 ///
 /// Returns `(polarity, blobs)` four times over. Polarity is `1.0` for dark ink
 /// on a light background and `-1.0` for light ink on dark.
+///
+/// A pixel is ink when, smoothed a little, it stands out from the mean of the
+/// square around it. The image is gone through once, a band of rows at a time,
+/// and nothing as big as the image is kept but one byte per pixel that says
+/// which of the four ways it is ink: on a phone, moving whole images through
+/// memory is what this stage would otherwise spend its time on.
 pub(crate) fn binarise(image: &Gray) -> Vec<(f64, Vec<Blob>)> {
-    /// A pixel is ink when it differs from its local mean by more than this many levels,
-    const CONTRAST: f32 = 7.0;
-    /// or, in a noisy image, by this many times what is left of the noise after smoothing;
-    /// otherwise the noise itself turns into thousands of blobs.
-    const NOISE_CLEARANCE: f32 = 3.0;
-    /// What a Gaussian blur of radius 1 leaves of independent pixel noise.
-    const SMOOTHED: f32 = 0.282;
-    const WINDOWS: [usize; 2] = [31, 91];
+    /// The squares that local means are taken over, in cells: 28 and 92 pixels.
+    const WINDOWS: [usize; 2] = [7, 23];
+    /// Rows handed out together to one core.
+    const BAND: usize = 32;
+    let (w, h) = (image.width, image.height);
     let contrast = CONTRAST.max(NOISE_CLEARANCE * SMOOTHED * noise_level(image));
-    let smooth = image.gaussian_blur(1.0);
-    let max_area = (smooth.width.min(smooth.height) as f64 / 5.0).powi(2);
-    // The four combinations are independent of each other.
-    let means = super::par::map_few(2, |i| smooth.box_blur(WINDOWS[i]));
-    super::par::map_few(4, |i| {
-        let (mean, polarity) = (&means[i / 2], if i % 2 == 0 { 1.0f32 } else { -1.0 });
-        let ink: Vec<bool> = smooth.data.iter().zip(&mean.data).map(|(v, m)| (v - m) * polarity < -contrast).collect();
-        (polarity as f64, find_blobs(smooth.width, smooth.height, &ink, max_area))
-    })
+    let cells = image.cell_means(CELL);
+    let means = super::par::map_few(2, |i| cells.box_blur(WINDOWS[i]));
+
+    // Bit `i` of a pixel's byte: ink for neighbourhood `i / 2`, dark if `i` is even, light if odd.
+    let mut ink = vec![0u8; w * h];
+    super::par::chunks(&mut ink, w * BAND, |band, rows| {
+        let (mut column, mut smooth) = (vec![0f32; w], vec![0f32; w]);
+        let (mut cells_row, mut near, mut far) = (vec![0f32; cells.width], vec![0f32; w], vec![0f32; w]);
+        for (i, row) in rows.chunks_mut(w).enumerate() {
+            let y = band * BAND + i;
+            smooth_row(image, y, &mut column, &mut smooth);
+            mean_row(&means[0], y, &mut cells_row, &mut near);
+            mean_row(&means[1], y, &mut cells_row, &mut far);
+            for (((o, v), near), far) in row.iter_mut().zip(&smooth).zip(&near).zip(&far) {
+                let (by_near, by_far) = (v - near, v - far);
+                *o = (by_near < -contrast) as u8
+                    | ((by_near > contrast) as u8) << 1
+                    | ((by_far < -contrast) as u8) << 2
+                    | ((by_far > contrast) as u8) << 3;
+            }
+        }
+    });
+    let max_area = (w.min(h) as f64 / 5.0).powi(2);
+    // The four are independent of each other.
+    super::par::map_few(4, |i| (if i % 2 == 0 { 1.0 } else { -1.0 }, find_blobs(w, h, &ink, 1 << i, max_area)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ink as [`find_blobs`] takes it, in bit 0.
+    fn bytes(ink: &[bool]) -> Vec<u8> {
+        ink.iter().map(|&i| i as u8).collect()
+    }
 
     #[test]
     fn regions_touching_at_a_corner_are_one_blob() {
@@ -214,7 +325,7 @@ mod tests {
         fill(1, 1, 3);
         fill(4, 4, 3);
         fill(12, 5, 4);
-        let mut blobs = find_blobs(w, h, &ink, 1000.0);
+        let mut blobs = find_blobs(w, h, &bytes(&ink), 1, 1000.0);
         blobs.sort_by(|a, b| a.x.total_cmp(&b.x));
         assert_eq!(blobs.len(), 2);
         assert_eq!(blobs[0].area, 18.0);
@@ -266,7 +377,43 @@ mod tests {
         let noisy = noisy_frame(30.0).gaussian_blur(1.0);
         let mean = noisy.box_blur(31);
         let ink: Vec<bool> = noisy.data.iter().zip(&mean.data).map(|(v, m)| v - m < -7.0).collect();
-        assert!(find_blobs(noisy.width, noisy.height, &ink, 1024.0).len() > 20);
+        assert!(find_blobs(noisy.width, noisy.height, &bytes(&ink), 1, 1024.0).len() > 20);
+    }
+
+    #[test]
+    fn rows_are_smoothed_and_means_spread_out_as_whole_images_would_be() {
+        let image = noisy_frame(8.0);
+        let (w, h) = (image.width, image.height);
+        let (mut column, mut row, mut cells_row) = (vec![0f32; w], vec![0f32; w], vec![0f32; w.div_ceil(CELL)]);
+        // Smoothing: against the same weights applied to the whole image.
+        let kernel = [1.0f32, 4.0, 6.0, 4.0, 1.0].map(|k| k / 16.0);
+        for y in [0, 1, 37, h - 1] {
+            smooth_row(&image, y, &mut column, &mut row);
+            for x in [0, 1, 2, 90, w - 2, w - 1] {
+                let mut want = 0.0;
+                for (i, ky) in kernel.iter().enumerate() {
+                    for (j, kx) in kernel.iter().enumerate() {
+                        want += ky * kx * image.get(reflect(x as isize + j as isize - 2, w), reflect(y as isize + i as isize - 2, h));
+                    }
+                }
+                assert!((row[x] - want).abs() < 1e-3, "{x} {y}");
+            }
+        }
+        // Means: a ramp given per cell comes back as the same ramp per pixel, flat beyond the outermost cell centres.
+        let mut cells = Gray::new(w.div_ceil(CELL), h.div_ceil(CELL));
+        let ramp = |x: f32, y: f32| 3.0 * x + 5.0 * y;
+        for cy in 0..cells.height {
+            for cx in 0..cells.width {
+                cells.data[cy * cells.width + cx] = ramp(cx as f32 * CELL as f32 + 1.5, cy as f32 * CELL as f32 + 1.5);
+            }
+        }
+        for y in [0, 2, 63, 64, 65, 66, h - 3, h - 1] {
+            mean_row(&cells, y, &mut cells_row, &mut row);
+            for x in 0..w {
+                let inside = |v: usize, n: usize| (v as f32).clamp(1.5, (n.div_ceil(CELL) - 1) as f32 * CELL as f32 + 1.5);
+                assert!((row[x] - ramp(inside(x, w), inside(y, h))).abs() < 1e-2, "{x} {y}");
+            }
+        }
     }
 
     #[test]
@@ -277,6 +424,6 @@ mod tests {
             ink[3 * w + x] = true; // a long thin line
         }
         ink[7 * w + 5] = true; // a speck
-        assert!(find_blobs(w, h, &ink, 1000.0).is_empty());
+        assert!(find_blobs(w, h, &bytes(&ink), 1, 1000.0).is_empty());
     }
 }

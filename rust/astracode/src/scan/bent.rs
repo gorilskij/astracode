@@ -170,7 +170,7 @@ pub(crate) fn mirrored(stars: &Placement) -> Placement {
 /// is no ring 1: this doubles as the test for "is this a one-ring code".
 pub(crate) fn with_ring1(view: View, h: &Homography, ring0: &[Point], shapes: Option<&[LocalMap]>) -> Option<Placement> {
     let p = patterns();
-    let found: Vec<Point> = locate_rings(view, h, 2, ring0, shapes).concat();
+    let found: Vec<Point> = locate_rings(view, h, 2, ring0, shapes, true).concat();
     let centers: Vec<Point> = p.rings[..2].concat();
     let stars = local_fit(&Homography::fit(&centers, &found), &centers, &found, Neighbours::Surrounded);
     let stand_out = contrast(&read_levels(view.image, &stars), view.polarity);

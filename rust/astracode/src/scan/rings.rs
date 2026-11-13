@@ -63,49 +63,155 @@ pub(crate) struct Neighbourhood {
     crowd: Vec<usize>,
 }
 
+/// May two blobs be neighbours in a ring, going by their sizes?
+fn similar(a: f64, b: f64) -> bool {
+    a.max(b) < 2.3 * a.min(b)
+}
+/// Neighbours are looked for within this many times the larger blob's size, and for
+/// the wider list within [`FAR`] times; nearer than [`TOUCHING`] they overlap.
+const NEAR: f64 = 6.5;
+const FAR: f64 = 13.0;
+const TOUCHING: f64 = 0.8;
+
+/// The `keep` closest of a list of blobs given as (distance squared, blob), closest
+/// first and the lower index first among equals.
+fn closest(mut list: Vec<(f64, u32)>, keep: usize) -> Vec<u32> {
+    let order = |a: &(f64, u32), b: &(f64, u32)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
+    if list.len() > keep {
+        list.select_nth_unstable_by(keep - 1, order);
+        list.truncate(keep);
+    }
+    list.sort_unstable_by(order);
+    list.into_iter().map(|(_, blob)| blob).collect()
+}
+
+/// Blobs sorted into square cells, so that those near a place can be gone
+/// through without looking at all the rest.
+struct Cells {
+    side: f64,
+    left: f64,
+    top: f64,
+    across: usize,
+    down: usize,
+    /// Cell `c` holds `blobs[starts[c]..starts[c + 1]]`.
+    starts: Vec<u32>,
+    blobs: Vec<u32>,
+}
+
+impl Cells {
+    fn new(pts: &[Point], side: f64) -> Cells {
+        let low = |k: usize| pts.iter().map(|p| p[k]).fold(f64::INFINITY, f64::min);
+        let high = |k: usize| pts.iter().map(|p| p[k]).fold(f64::NEG_INFINITY, f64::max);
+        let (left, top) = if pts.is_empty() { (0.0, 0.0) } else { (low(0), low(1)) };
+        let count = |from: f64, to: f64| if pts.is_empty() { 1 } else { ((to - from) / side) as usize + 1 };
+        let (across, down) = (count(left, high(0)), count(top, high(1)));
+        let mut cells = Cells { side, left, top, across, down, starts: vec![0; across * down + 1], blobs: vec![0; pts.len()] };
+        // A counting sort: how many per cell, then where each cell starts, then the blobs in index order.
+        let homes: Vec<usize> = pts.iter().map(|&p| cells.home(p)).map(|(x, y)| y * across + x).collect();
+        for &home in &homes {
+            cells.starts[home + 1] += 1;
+        }
+        for c in 0..across * down {
+            cells.starts[c + 1] += cells.starts[c];
+        }
+        let mut next = cells.starts.clone();
+        for (blob, &home) in homes.iter().enumerate() {
+            cells.blobs[next[home] as usize] = blob as u32;
+            next[home] += 1;
+        }
+        cells
+    }
+
+    /// The cell a point is in, as column and row.
+    fn home(&self, p: Point) -> (usize, usize) {
+        ((((p[0] - self.left) / self.side) as usize).min(self.across - 1), (((p[1] - self.top) / self.side) as usize).min(self.down - 1))
+    }
+
+    /// Call `f` with each blob in the cells exactly `ring` cells away from `home`
+    /// (the square ring round it; `ring` 0 is the cell itself). False if the whole
+    /// ring is outside the grid: there is nothing further out either.
+    fn ring(&self, home: (usize, usize), ring: usize, mut f: impl FnMut(u32)) -> bool {
+        let (hx, hy, r) = (home.0 as isize, home.1 as isize, ring as isize);
+        let mut inside = false;
+        for y in (hy - r).max(0)..=(hy + r).min(self.down as isize - 1) {
+            let edge = (y - hy).abs() == r;
+            let mut cell = |x: isize| {
+                if x >= 0 && x < self.across as isize {
+                    inside = true;
+                    let c = y as usize * self.across + x as usize;
+                    self.blobs[self.starts[c] as usize..self.starts[c + 1] as usize].iter().for_each(|&b| f(b));
+                }
+            };
+            if edge {
+                (hx - r..=hx + r).for_each(&mut cell);
+            } else {
+                cell(hx - r);
+                cell(hx + r);
+            }
+        }
+        inside
+    }
+}
+
 impl Neighbourhood {
     pub fn new(blobs: &[Blob]) -> Neighbourhood {
         let n = blobs.len();
         let pts: Vec<Point> = blobs.iter().map(|b| [b.x, b.y]).collect();
         let size: Vec<f64> = blobs.iter().map(|b| b.area.sqrt()).collect();
-        let mut near_d: Vec<Vec<(f64, u32)>> = vec![Vec::new(); n];
-        let mut far_d: Vec<Vec<(f64, u32)>> = vec![Vec::new(); n];
-        for i in 0..n {
-            for j in i + 1..n {
-                let (big, small) = (size[i].max(size[j]), size[i].min(size[j]));
-                // Similar in size, not overlapping, and within a few sizes of each other.
-                if big >= 2.3 * small {
-                    continue;
+        let mut sizes = size.clone();
+        sizes.sort_by(f64::total_cmp);
+        // Cells of a couple of blob sizes across, but no more cells than blobs.
+        let spread =
+            |k: usize| pts.iter().map(|p| p[k]).fold(f64::NEG_INFINITY, f64::max) - pts.iter().map(|p| p[k]).fold(f64::INFINITY, f64::min);
+        let side = if n == 0 { 1.0 } else { (2.0 * sizes[n / 2]).max((spread(0) * spread(1) / n as f64).sqrt()).max(1.0) };
+        let cells = Cells::new(&pts, side);
+
+        // Each blob looks outwards from its own cell, a ring of cells at a time, and stops
+        // when no blob further out could be a neighbour of either kind.
+        let found: Vec<(Vec<u32>, Vec<u32>, usize)> = super::par::map(n, |i| {
+            // The largest blob that could be this one's neighbour sets how far that is.
+            let largest = sizes[sizes.partition_point(|&s| s < 2.3 * size[i]) - 1].max(size[i]);
+            // Candidates as (distance squared, blob); squares throughout, so that no roots are taken.
+            let (mut near, mut far) = (Vec::<(f64, u32)>::new(), Vec::<(f64, u32)>::new());
+            let home = cells.home(pts[i]);
+            for ring in 0.. {
+                let inside = cells.ring(home, ring, |j| {
+                    let j = j as usize;
+                    // Similar in size, not overlapping, and within a few sizes of each other.
+                    if j == i || !similar(size[i], size[j]) {
+                        return;
+                    }
+                    let big = size[i].max(size[j]);
+                    let (dx, dy) = (pts[i][0] - pts[j][0], pts[i][1] - pts[j][1]);
+                    let (d2, big2) = (dx * dx + dy * dy, big * big);
+                    if d2 <= TOUCHING * TOUCHING * big2 || d2 >= FAR * FAR * big2 {
+                        return;
+                    }
+                    far.push((d2, j as u32));
+                    if d2 < NEAR * NEAR * big2 {
+                        near.push((d2, j as u32));
+                    }
+                });
+                // Every blob not yet looked at is further away than this.
+                let covered = ring as f64 * cells.side;
+                if !inside || covered >= FAR * largest {
+                    break;
                 }
-                let (dx, dy) = (pts[i][0] - pts[j][0], pts[i][1] - pts[j][1]);
-                if dx.abs() >= 13.0 * big || dy.abs() >= 13.0 * big {
-                    continue;
-                }
-                let d = dx.hypot(dy);
-                if d <= 0.8 * big || d >= 13.0 * big {
-                    continue;
-                }
-                far_d[i].push((d, j as u32));
-                far_d[j].push((d, i as u32));
-                if d < 6.5 * big {
-                    near_d[i].push((d, j as u32));
-                    near_d[j].push((d, i as u32));
+                // Near neighbours all seen, and enough far ones closer than anything still to come?
+                if covered >= NEAR * largest && far.iter().filter(|f| f.0 < covered * covered).count() >= 3 * NEAREST {
+                    break;
                 }
             }
+            let crowd = near.len();
+            (closest(near, NEAREST), closest(far, 3 * NEAREST), crowd)
+        });
+        let (mut near, mut far, mut crowd) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+        for (n, f, c) in found {
+            near.push(n);
+            far.push(f);
+            crowd.push(c);
         }
-        let crowd = near_d.iter().map(Vec::len).collect();
-        let closest = |mut list: Vec<(f64, u32)>, keep: usize| -> Vec<u32> {
-            list.sort_by(|a, b| a.0.total_cmp(&b.0));
-            list.truncate(keep);
-            list.into_iter().map(|(_, j)| j).collect()
-        };
-        Neighbourhood {
-            near: near_d.into_iter().map(|l| closest(l, NEAREST)).collect(),
-            far: far_d.into_iter().map(|l| closest(l, 3 * NEAREST)).collect(),
-            pts,
-            size,
-            crowd,
-        }
+        Neighbourhood { near, far, pts, size, crowd }
     }
 
     pub fn len(&self) -> usize {
@@ -308,6 +414,72 @@ mod tests {
             // An ellipse, as a tilted ring appears.
             .map(|a| Blob { x: 300.0 + 120.0 * a.cos() + 20.0 * a.sin(), y: 200.0 + 70.0 * a.sin(), area: 400.0 })
             .collect()
+    }
+
+    /// Neighbour lists the plain way: every blob against every other.
+    fn every_pair(blobs: &[Blob]) -> Neighbourhood {
+        let n = blobs.len();
+        let pts: Vec<Point> = blobs.iter().map(|b| [b.x, b.y]).collect();
+        let size: Vec<f64> = blobs.iter().map(|b| b.area.sqrt()).collect();
+        let mut near_d: Vec<Vec<(f64, u32)>> = vec![Vec::new(); n];
+        let mut far_d: Vec<Vec<(f64, u32)>> = vec![Vec::new(); n];
+        for i in 0..n {
+            for j in i + 1..n {
+                let (big, small) = (size[i].max(size[j]), size[i].min(size[j]));
+                // Similar in size, not overlapping, and within a few sizes of each other.
+                if big >= 2.3 * small {
+                    continue;
+                }
+                let (dx, dy) = (pts[i][0] - pts[j][0], pts[i][1] - pts[j][1]);
+                // Distances as their squares, as in `Neighbourhood::new`.
+                let (d, big2) = (dx * dx + dy * dy, big * big);
+                if d <= 0.8 * 0.8 * big2 || d >= 13.0 * 13.0 * big2 {
+                    continue;
+                }
+                far_d[i].push((d, j as u32));
+                far_d[j].push((d, i as u32));
+                if d < 6.5 * 6.5 * big2 {
+                    near_d[i].push((d, j as u32));
+                    near_d[j].push((d, i as u32));
+                }
+            }
+        }
+        let crowd = near_d.iter().map(Vec::len).collect();
+        let closest = |mut list: Vec<(f64, u32)>, keep: usize| -> Vec<u32> {
+            list.sort_by(|a, b| a.0.total_cmp(&b.0));
+            list.truncate(keep);
+            list.into_iter().map(|(_, j)| j).collect()
+        };
+        Neighbourhood {
+            near: near_d.into_iter().map(|l| closest(l, NEAREST)).collect(),
+            far: far_d.into_iter().map(|l| closest(l, 3 * NEAREST)).collect(),
+            pts,
+            size,
+            crowd,
+        }
+    }
+
+    #[test]
+    fn neighbours_found_through_cells_are_those_found_pair_by_pair() {
+        let mut state = 7u64;
+        let mut unit = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 40) as f64 / (1u64 << 24) as f64
+        };
+        // A dense field of like blobs on a grid (many equal distances), a sparse scatter
+        // of every size, a single blob, and none.
+        let mut sets: Vec<Vec<Blob>> = Vec::new();
+        sets.push((0..900).map(|i| Blob { x: 20.0 * (i % 30) as f64, y: 20.0 * (i / 30) as f64, area: 90.0 + (i % 7) as f64 }).collect());
+        sets.push((0..700).map(|_| Blob { x: 1900.0 * unit(), y: 1400.0 * unit(), area: 9.0 + 4000.0 * unit().powi(4) }).collect());
+        sets.push((0..400).map(|_| Blob { x: 300.0 * unit(), y: 200.0 * unit(), area: 20.0 + 30.0 * unit() }).collect());
+        sets.push(vec![Blob { x: 5.0, y: 5.0, area: 30.0 }]);
+        sets.push(Vec::new());
+        for blobs in &sets {
+            let (quick, plain) = (Neighbourhood::new(blobs), every_pair(blobs));
+            assert_eq!(quick.crowd, plain.crowd);
+            assert_eq!(quick.near, plain.near);
+            assert_eq!(quick.far, plain.far);
+        }
     }
 
     #[test]

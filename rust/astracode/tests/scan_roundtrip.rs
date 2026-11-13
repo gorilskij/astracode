@@ -144,7 +144,8 @@ fn bloomed(image: &Rgb, radius: usize) -> Rgb {
                 for channel in 0..3 {
                     let (at, length) = if vertical { (y, h) } else { (x, w) };
                     let range = at.saturating_sub(radius)..(at + radius + 1).min(length);
-                    let brightest = range.map(|i| if vertical { before[3 * (i * w + x) + channel] } else { before[3 * (y * w + i) + channel] }).max();
+                    let brightest =
+                        range.map(|i| if vertical { before[3 * (i * w + x) + channel] } else { before[3 * (y * w + i) + channel] }).max();
                     pixels[3 * (y * w + x) + channel] = brightest.expect("a pixel is within reach of itself");
                 }
             }

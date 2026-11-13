@@ -23,3 +23,14 @@ pub(crate) fn map_few<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T
     #[cfg(not(feature = "parallel"))]
     (0..n).map(f).collect()
 }
+
+/// Call `f(index, chunk)` for each `size` items of `data`, on all cores.
+pub(crate) fn chunks<T: Send>(data: &mut [T], size: usize, f: impl Fn(usize, &mut [T]) + Sync) {
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        data.par_chunks_mut(size).enumerate().for_each(|(i, chunk)| f(i, chunk));
+    }
+    #[cfg(not(feature = "parallel"))]
+    data.chunks_mut(size).enumerate().for_each(|(i, chunk)| f(i, chunk));
+}

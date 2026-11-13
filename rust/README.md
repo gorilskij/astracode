@@ -174,20 +174,41 @@ distorted frames (medians):
 
 | Frame | Read | No code in frame |
 |---|---|---|
-| One ring, 960 x 720 | 5 ms | 9 ms |
-| 2 to 5 rings, 1280 x 960 | 8 ms | 15 ms |
-| 6 to 12 rings, 1280 x 960 | 17 ms | 17 ms |
-| 14 to 24 rings, 2560 x 1920 | 62 ms | 43 ms |
+| One ring, 960 x 720 | 4 ms | 7 ms |
+| 2 to 5 rings, 1280 x 960 | 6 ms | 11 ms |
+| 6 to 12 rings, 1280 x 960 | 9 ms | 14 ms |
+| 14 to 24 rings, 2560 x 1920 | 24 ms | 31 ms |
+
+On one core, a clean phone frame (1440 x 1920) with the code filling it takes
+about 15 ms for one to three rings, 23 ms for five, 33 ms for twelve and 78 ms
+for twenty-four; a frame with no code in it, 5 ms per plane tried.
 
 Per-star work and the image passes run on all cores through `rayon`; build
 with `--no-default-features` for a single-threaded library. To see where time
 goes, `astracode scan --repeat 200 --threads 1 image.png` gives a profiler
 something steady to sample; the release profile keeps function names.
 
-Where the time is, after the first round of optimisation:
+Where the time is, after the second round of optimisation:
 
-* finding stars (two blurs, thresholding, blob labelling) dominates frames
-  without a code, and runs up to four times per RGB frame because each colour
-  channel is tried when brightness finds nothing;
+* finding stars is one pass over the image (smoothing, thresholding against
+  local means kept per 4-pixel cell, one byte per pixel out) and then blob
+  labelling. It runs up to four times per RGB frame, because each colour
+  channel is tried when brightness finds nothing; a grey frame, which is what
+  a phone camera hands over, is gone through once;
 * matching the star outline dominates reading: around ring 0 while aligning,
-  and around every outer star while locating it.
+  and around every outer star while locating it. The outer stars are matched
+  in a straightened copy of the image, of which only the band the next rings
+  are in is made;
+* the outer stars are looked for quickly first: on a coarse grid, at one star
+  size once the place is known. That finds a flat surface's stars as well as a
+  careful search does, at a third of the cost. Only if the code cannot be read
+  from that, and the stars found say the surface bends, does the careful
+  search run, followed by fitting every star's own shape, the dearest step
+  there is;
+* so a big code that is found but cannot be read costs little more than one
+  that can, as long as it is on a flat surface, which is most of them.
+
+What did not pay: taking the nearest pixel instead of interpolating when
+straightening (a tenth quicker on big codes, six reads fewer in 810); and the
+quick search on its own, without the careful one behind it (three reads fewer
+in 840 on bent surfaces).
