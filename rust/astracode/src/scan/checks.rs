@@ -56,7 +56,18 @@ fn ring_outline(view: View, h: &Homography, scale: f64) -> f64 {
 /// Deep inside a code with many rings, a star's twelve second-nearest
 /// neighbours form a loop that passes for ring 0, except that the loop is too
 /// small for its stars. Compare the star outline at three sizes.
+///
+/// Only dark stars are held to this. A camera does not show the two
+/// polarities alike: light bleeds outwards, so light stars on a dark ground
+/// look bigger than they are, by a pixel or more whatever their size (a fifth
+/// bigger is nothing unusual for small stars on a bright screen), and would
+/// fail a test that dark stars, which look smaller if anything, pass with room
+/// to spare. Look-alike loops of light stars are left to [`centre_is_code`]
+/// and [`band_clear`], which do not depend on size.
 pub(crate) fn stars_fit(view: View, h: &Homography) -> bool {
+    if view.polarity < 0.0 {
+        return true;
+    }
     let (small, right, big) = (ring_outline(view, h, 0.85), ring_outline(view, h, 1.0), ring_outline(view, h, 1.18));
     right > 0.0 && (big - small) / right <= 0.06
 }

@@ -131,6 +131,42 @@ fn a_code_sizes_itself_and_scans_at_several_sizes() {
     }
 }
 
+/// The image with everything light grown by `radius` pixels, as a camera
+/// shows bright shapes on a dark ground: light bleeds outwards.
+fn bloomed(image: &Rgb, radius: usize) -> Rgb {
+    let (w, h) = (image.width, image.height);
+    let mut pixels = image.pixels.clone();
+    // The largest value within `radius`, along rows and then along columns.
+    for vertical in [false, true] {
+        let before = pixels.clone();
+        for y in 0..h {
+            for x in 0..w {
+                for channel in 0..3 {
+                    let (at, length) = if vertical { (y, h) } else { (x, w) };
+                    let range = at.saturating_sub(radius)..(at + radius + 1).min(length);
+                    let brightest = range.map(|i| if vertical { before[3 * (i * w + x) + channel] } else { before[3 * (y * w + i) + channel] }).max();
+                    pixels[3 * (y * w + x) + channel] = brightest.expect("a pixel is within reach of itself");
+                }
+            }
+        }
+    }
+    Rgb { width: w, height: h, pixels }
+}
+
+#[test]
+fn light_stars_that_look_bigger_than_they_are_still_scan() {
+    let text = "light ink on a dark ground, photographed from a screen";
+    let symbols = code::encode(&Payload::from_bytes(text), 1).unwrap();
+    assert_eq!(symbols.len(), 6);
+    // Stars about 26, 40 and 58 pixels tall, grown by one, two and three pixels all round.
+    for (size, radius) in [(450, 1), (700, 2), (1000, 3)] {
+        let style = Style { ink: "#febc5c".into(), background: "#021639".into(), size, ..Style::default() };
+        let found = scan(&bloomed(&render(&symbols, &style), radius));
+        assert_eq!(found.len(), 1, "size {size}, grown by {radius}");
+        assert_eq!(found[0].payload.as_text(), Some(text));
+    }
+}
+
 #[test]
 fn a_small_payload_in_a_bigger_code_scans() {
     let symbols = code::encode_with_rings(&Payload::from_bytes("hi"), 2, 3).unwrap();
