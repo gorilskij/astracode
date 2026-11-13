@@ -8,9 +8,9 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use astracode::format::ring0;
+use astracode::astra::Number;
 use astracode::image::Gray;
-use astracode::scan::{scan_gray, Code, Options, Payload};
+use astracode::scan::{scan_gray, Code, Options};
 use jni::objects::{JByteBuffer, JClass};
 use jni::sys::{jbyteArray, jint};
 use jni::JNIEnv;
@@ -20,7 +20,6 @@ use jni::JNIEnv;
 /// ```text
 /// u8   number of codes
 /// then, for each code:
-///   u8   kind: 0 = one-ring code, 1 = message
 ///   u8   rings
 ///   u8   error-correction level (0 for a one-ring code)
 ///   u8   flags: bit 0 = seen as a mirror image, bit 1 = read from the star shapes (bent surface)
@@ -28,34 +27,34 @@ use jni::JNIEnv;
 ///   f32  how inked the light limbs are relative to solid, 0 to 1
 ///   f32  x 8: the corners of the code's square, x then y, in frame pixels:
 ///             top left, top right, bottom right, bottom left
-///   kind 0:  u8 metadata, u64 payload, 12 ASCII digits of member ID
-///   kind 1:  u32 length, then the message bytes
+///   u32  length of the payload in bits
+///   then the payload: that many bits packed into bytes, first bit highest,
+///             the last byte padded with zero bits
+///   u8   1 if the payload is an Astra number, else 0; if 1, then:
+///     u8 metadata, u64 payload, 12 ASCII digits of member ID
 /// ```
+///
+/// Whether a payload is an Astra number is decided here, by
+/// [`astracode::astra`], so that the app does not carry its own copy of that rule.
 fn encode(codes: &[Code]) -> Vec<u8> {
     let mut out = vec![codes.len().min(255) as u8];
     for code in codes.iter().take(255) {
-        let (kind, level) = match &code.payload {
-            Payload::Number(_) => (0u8, 0u8),
-            Payload::Message { level, .. } => (1, *level),
-        };
-        out.extend([kind, code.rings as u8, level, code.mirrored as u8 | (code.shaped as u8) << 1]);
+        out.extend([code.rings as u8, code.level, code.mirrored as u8 | (code.shaped as u8) << 1]);
         out.extend((code.repaired.min(u16::MAX as usize) as u16).to_le_bytes());
         out.extend((code.light_level as f32).to_le_bytes());
         for corner in code.corners {
             out.extend((corner[0] as f32).to_le_bytes());
             out.extend((corner[1] as f32).to_le_bytes());
         }
-        match &code.payload {
-            Payload::Number(value) => {
-                let (metadata, payload) = ring0::unpack(*value);
-                out.push(metadata as u8);
-                out.extend(payload.to_le_bytes());
-                out.extend(ring0::member_id(payload).as_bytes());
+        out.extend((code.payload.len() as u32).to_le_bytes());
+        out.extend(code.payload.padded_bytes());
+        match Number::from_payload(&code.payload) {
+            Some(number) => {
+                out.extend([1, number.metadata]);
+                out.extend(number.payload.to_le_bytes());
+                out.extend(number.member_id().as_bytes());
             }
-            Payload::Message { bytes, .. } => {
-                out.extend((bytes.len() as u32).to_le_bytes());
-                out.extend(bytes);
-            }
+            None => out.push(0),
         }
     }
     out
@@ -110,13 +109,15 @@ pub extern "system" fn Java_app_astracode_scanner_NativeScanner_scan<'local>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astracode::scan::Payload;
 
     #[test]
     fn results_are_laid_out_as_documented() {
         let corners = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]];
         let base = Code {
-            payload: Payload::Number(ring0::pack(5, 4_320_880_580).unwrap()),
+            payload: Number::new(5, 4_320_880_580).unwrap().to_payload(),
             rings: 1,
+            level: 0,
             corners,
             mirrored: true,
             repaired: 1,
@@ -125,21 +126,23 @@ mod tests {
             separation: 9.0,
             light_level: 0.5,
         };
-        let message =
-            Code { payload: Payload::Message { level: 2, bytes: b"hi".to_vec() }, rings: 3, mirrored: false, shaped: true, ..base.clone() };
-        let bytes = encode(&[base, message]);
+        let text = Code { payload: Payload::from_bytes("hi"), rings: 3, level: 2, mirrored: false, shaped: true, ..base.clone() };
+        let bytes = encode(&[base, text]);
         assert_eq!(bytes[0], 2);
-        // First code: kind, rings, level, flags, repaired.
-        assert_eq!(&bytes[1..7], &[0, 1, 0, 1, 1, 0]);
-        assert_eq!(f32::from_le_bytes(bytes[7..11].try_into().unwrap()), 0.5);
-        assert_eq!(f32::from_le_bytes(bytes[11..15].try_into().unwrap()), 1.0);
-        assert_eq!(f32::from_le_bytes(bytes[39..43].try_into().unwrap()), 8.0);
-        assert_eq!(bytes[43], 5);
-        assert_eq!(u64::from_le_bytes(bytes[44..52].try_into().unwrap()), 4_320_880_580);
-        assert_eq!(&bytes[52..64], b"432088058060");
-        // Second code.
-        assert_eq!(&bytes[64..70], &[1, 3, 2, 2, 1, 0]);
-        assert_eq!(u32::from_le_bytes(bytes[106..110].try_into().unwrap()), 2);
-        assert_eq!(&bytes[110..], b"hi");
+        // First code: rings, level, flags, repaired.
+        assert_eq!(&bytes[1..6], &[1, 0, 1, 1, 0]);
+        assert_eq!(f32::from_le_bytes(bytes[6..10].try_into().unwrap()), 0.5);
+        assert_eq!(f32::from_le_bytes(bytes[10..14].try_into().unwrap()), 1.0);
+        assert_eq!(f32::from_le_bytes(bytes[38..42].try_into().unwrap()), 8.0);
+        // Its payload: 38 bits in five bytes, then the Astra number they stand for.
+        assert_eq!(u32::from_le_bytes(bytes[42..46].try_into().unwrap()), 38);
+        assert_eq!(u64::from_be_bytes([0, 0, 0, bytes[46], bytes[47], bytes[48], bytes[49], bytes[50]]) >> 2, 54_320_880_580);
+        assert_eq!(&bytes[51..53], &[1, 5]);
+        assert_eq!(u64::from_le_bytes(bytes[53..61].try_into().unwrap()), 4_320_880_580);
+        assert_eq!(&bytes[61..73], b"432088058060");
+        // Second code: plain bytes, not an Astra number.
+        assert_eq!(&bytes[73..78], &[3, 2, 2, 1, 0]);
+        assert_eq!(u32::from_le_bytes(bytes[114..118].try_into().unwrap()), 16);
+        assert_eq!(&bytes[118..], b"hi\0");
     }
 }

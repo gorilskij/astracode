@@ -4,14 +4,16 @@
 //! significant first, followed by 4 Reed-Solomon check symbols over GF(32),
 //! and the twelve are XORed with [`MASK`].
 //!
-//! What the value means depends on its range:
+//! The value's top bit says whether the code has more rings:
 //!
-//! * below [`MAX_NUMBER`]: a **one-ring code**, `metadata * 10^10 + payload`,
-//!   see [`pack`]. The use this was designed for is a 12-digit member ID whose
-//!   last two digits are the first ten modulo 97; only the ten are stored
-//!   ([`member_id`]).
-//! * from [`MAX_NUMBER`] up: the **header** of a code with more rings, see
-//!   [`Header`].
+//! * `0`: ring 0 is the whole code, and the other [`ONE_RING_BITS`] = 39 bits
+//!   are the stream (the payload, a 1 bit, then zeros).
+//! * `1`: then 5 bits giving the number of rings minus one (1 to 23), 2 bits
+//!   giving the error-correction level of the outer rings, and the first
+//!   [`HEAD_BITS`] = 32 bits of the stream.
+//!
+//! Either way ring 0 is a [`Header`]: it tells a reader how many rings to
+//! expect before anything else is read. See [`super::code`] for the stream.
 //!
 //! Reading is deliberately cautious: at most one star is repaired, or two that
 //! the reader has already singled out as doubtful.
@@ -19,45 +21,60 @@
 use super::gf::gf32;
 use super::mix::{mix, unmix};
 use super::reed_solomon;
-use super::{FormatError, MASK, MAX_NUMBER, MAX_RINGS, METADATA_LIMIT, N_DATA, N_STARS, PAYLOAD_LIMIT};
+use super::{MASK, MAX_RINGS, N_DATA, N_STARS};
 
 /// The twelve symbols of ring 0 as drawn. Each is `0..32`.
 pub type Symbols = [u8; N_STARS];
 
-/// Metadata `0..=108` and a payload of up to ten digits, as one stored value.
-pub fn pack(metadata: u64, payload: u64) -> Result<u64, FormatError> {
-    if metadata >= METADATA_LIMIT {
-        return Err(FormatError::Metadata);
-    }
-    if payload >= PAYLOAD_LIMIT {
-        return Err(FormatError::Payload);
-    }
-    Ok(metadata * PAYLOAD_LIMIT + payload)
+/// Stream bits in ring 0 when it is the whole code.
+pub const ONE_RING_BITS: usize = 39;
+/// Stream bits in ring 0 when more rings follow.
+pub const HEAD_BITS: usize = 32;
+
+/// What ring 0 says about its code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Header {
+    /// Total number of rings, `1..=24`.
+    pub rings: usize,
+    /// Error-correction level of the outer rings, `0..4`. Always 0 for a
+    /// one-ring code, which has no outer rings.
+    pub level: u8,
+    /// Ring 0's whole 40-bit value. The outer rings' check symbols cover all of it.
+    pub value: u64,
+    /// Stars of ring 0 that had to be repaired to read this.
+    pub repaired: usize,
 }
 
-/// A one-ring value split into `(metadata, payload)`.
-pub fn unpack(value: u64) -> (u64, u64) {
-    (value / PAYLOAD_LIMIT, value % PAYLOAD_LIMIT)
+impl Header {
+    /// How many bits of the stream ring 0 carries.
+    pub fn head_bits(&self) -> usize {
+        head_bits(self.rings)
+    }
+
+    /// Those bits, the first of them highest.
+    pub fn head(&self) -> u64 {
+        self.value & ((1 << self.head_bits()) - 1)
+    }
 }
 
-/// The 12-digit member ID for a 10-digit payload: the payload, then the payload modulo 97.
-pub fn member_id(payload: u64) -> String {
-    format!("{:010}{:02}", payload, payload % 97)
+/// How many bits of the stream ring 0 carries in a code with this many rings.
+pub(crate) fn head_bits(rings: usize) -> usize {
+    if rings == 1 {
+        ONE_RING_BITS
+    } else {
+        HEAD_BITS
+    }
 }
 
-/// The payload of a 12-digit member ID. Anything but digits is ignored;
-/// fails if there are not twelve digits or the last two do not check out.
-pub fn payload_of_member_id(text: &str) -> Result<u64, FormatError> {
-    let digits: String = text.chars().filter(char::is_ascii_digit).collect();
-    if digits.len() != 12 {
-        return Err(FormatError::MemberId);
+/// Ring 0's value for a code with `rings` rings at `level`, with the first
+/// bits of the stream in `head`.
+pub(crate) fn value(rings: usize, level: u8, head: u64) -> u64 {
+    debug_assert!(head >> head_bits(rings) == 0);
+    if rings == 1 {
+        head
+    } else {
+        1 << 39 | (rings as u64 - 1) << 34 | (level as u64) << 32 | head
     }
-    let payload: u64 = digits[..10].parse().map_err(|_| FormatError::MemberId)?;
-    let check: u64 = digits[10..].parse().map_err(|_| FormatError::MemberId)?;
-    if payload % 97 != check {
-        return Err(FormatError::MemberId);
-    }
-    Ok(payload)
 }
 
 /// Any 40-bit value as ring 0's twelve symbols.
@@ -70,14 +87,6 @@ pub(crate) fn encode_value(value: u64) -> Symbols {
     let checks = reed_solomon::parity(gf32(), &cw[..N_DATA], N_STARS - N_DATA);
     cw[N_DATA..].copy_from_slice(&checks);
     std::array::from_fn(|i| cw[i] as u8 ^ MASK[i])
-}
-
-/// The twelve symbols of a one-ring code for a value from [`pack`].
-pub fn encode(value: u64) -> Result<Symbols, FormatError> {
-    if value >= MAX_NUMBER {
-        return Err(FormatError::Value);
-    }
-    Ok(encode_value(value))
 }
 
 /// Ring 0's symbols back to its 40-bit value, with the number of stars repaired.
@@ -100,45 +109,19 @@ pub(crate) fn decode_value(symbols: &Symbols, doubtful: Option<(usize, usize)>) 
     Some((unmix(mixed), repaired))
 }
 
-/// Read a one-ring code: `(value, stars repaired)`, or `None` if the check
-/// fails or this is the header of a bigger code.
-pub fn decode(symbols: &Symbols, doubtful: Option<(usize, usize)>) -> Option<(u64, usize)> {
-    decode_value(symbols, doubtful).filter(|&(value, _)| value < MAX_NUMBER)
-}
-
-/// What ring 0 of a code with more rings says about the rest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Header {
-    /// Total number of rings, `2..=24`.
-    pub rings: usize,
-    /// Error-correction level of the outer rings, `0..4`.
-    pub level: u8,
-    /// Ring 0's whole 40-bit value. Its low 26 bits are the first bits of the
-    /// message, and the outer rings' check symbols cover all of it.
-    pub value: u64,
-    /// Stars of ring 0 that had to be repaired to read this.
-    pub repaired: usize,
-}
-
-/// Message bits carried in ring 0 of a code with more rings.
-pub(crate) const HEAD_BITS: usize = 26;
-
-/// The header value for a code with `rings` rings at `level`, with the first
-/// [`HEAD_BITS`] bits of the message in `head`.
-pub(crate) fn header_value(rings: usize, level: u8, head: u32) -> u64 {
-    MAX_NUMBER + ((rings as u64) << 28 | (level as u64) << 26 | head as u64)
-}
-
-/// Read ring 0 as a header, or `None` if the check fails or this is a one-ring code.
-pub fn read_header(symbols: &Symbols, doubtful: Option<(usize, usize)>) -> Option<Header> {
+/// Read ring 0. `None` if its check fails, or if what it says cannot be: a
+/// number of rings above 24, or a one-ring stream with no end.
+///
+/// `doubtful` may name two stars the reader is unsure of; see [`decode_value`].
+pub fn read(symbols: &Symbols, doubtful: Option<(usize, usize)>) -> Option<Header> {
     let (value, repaired) = decode_value(symbols, doubtful)?;
-    if value < MAX_NUMBER {
-        return None;
+    if value >> 39 == 0 {
+        // The stream ends with a 1 bit, so it is never all zeros.
+        return (value != 0).then_some(Header { rings: 1, level: 0, value, repaired });
     }
-    let bits = value - MAX_NUMBER;
-    let rings = (bits >> 28) as usize;
-    let level = ((bits >> 26) & 3) as u8;
-    (2..=MAX_RINGS).contains(&rings).then_some(Header { rings, level, value, repaired })
+    let rings = (value >> 34 & 31) as usize + 1;
+    let level = (value >> 32 & 3) as u8;
+    (rings <= MAX_RINGS).then_some(Header { rings, level, value, repaired })
 }
 
 #[cfg(test)]
@@ -146,36 +129,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn member_ids_round_trip() {
-        assert_eq!(member_id(4_320_880_580), "432088058060");
-        assert_eq!(payload_of_member_id("4320 8805 8060"), Ok(4_320_880_580));
-        assert_eq!(payload_of_member_id("432088058061"), Err(FormatError::MemberId));
-    }
-
-    #[test]
     fn a_misread_star_is_repaired() {
-        let value = pack(5, 4_320_880_580).unwrap();
-        let good = encode(value).unwrap();
-        assert_eq!(decode(&good, None), Some((value, 0)));
+        let value = value(1, 0, 0x12_3456_789B);
+        let good = encode_value(value);
+        let header = Header { rings: 1, level: 0, value, repaired: 0 };
+        assert_eq!(read(&good, None), Some(header));
         for star in 0..12 {
             let mut bad = good;
             bad[star] ^= 0b10110;
-            assert_eq!(decode(&bad, None), Some((value, 1)));
+            assert_eq!(read(&bad, None), Some(Header { repaired: 1, ..header }));
         }
         let mut bad = good;
         bad[1] ^= 3;
         bad[7] ^= 17;
-        assert_eq!(decode(&bad, None), None);
-        assert_eq!(decode(&bad, Some((7, 1))), Some((value, 2)));
+        assert_eq!(read(&bad, None), None);
+        assert_eq!(read(&bad, Some((7, 1))), Some(Header { repaired: 2, ..header }));
     }
 
     #[test]
-    fn headers_and_one_ring_codes_do_not_mix() {
-        let symbols = encode_value(header_value(5, 2, 0x155_5555));
-        assert_eq!(decode(&symbols, None), None);
-        let header = read_header(&symbols, None).unwrap();
-        assert_eq!((header.rings, header.level, header.repaired), (5, 2, 0));
-        assert_eq!(read_header(&encode(pack(0, 1).unwrap()).unwrap(), None), None);
-        assert_eq!(encode(MAX_NUMBER), Err(FormatError::Value));
+    fn ring_0_says_how_many_rings_there_are() {
+        for (rings, level) in [(2, 0), (5, 2), (24, 3)] {
+            let header = read(&encode_value(value(rings, level, 0x5555_5555)), None).unwrap();
+            assert_eq!((header.rings, header.level, header.head(), header.head_bits()), (rings, level, 0x5555_5555, 32));
+        }
+        let header = read(&encode_value(value(1, 0, 0x55_5555_5555)), None).unwrap();
+        assert_eq!((header.rings, header.head(), header.head_bits()), (1, 0x55_5555_5555, 39));
+    }
+
+    #[test]
+    fn impossible_values_are_refused() {
+        // A one-ring stream without its closing 1 bit.
+        assert_eq!(read(&encode_value(0), None), None);
+        // 25 rings.
+        assert_eq!(read(&encode_value(1 << 39 | 24 << 34), None), None);
     }
 }

@@ -1,8 +1,10 @@
 """Synthetic reliability test for the scanner.
 
 Renders random codes, places them in a camera-like frame with perspective, blur,
-noise, uneven light and JPEG damage, scans them, and reports hit / miss / wrong.
+noise, uneven light and JPEG damage, scans them with the Rust scanner, and
+reports hit / miss / wrong.
 
+    (cd rust && cargo build --release)
     .venv/bin/python bench.py [count] [level] [--rings N | --rings LOW-HIGH] [--wavy STRAIN] [--save-fails DIR]
 
 --wavy 0.1 prints the code on a surface that is not flat: smooth waves, about as long
@@ -11,18 +13,25 @@ code is visibly bent out of shape.
 
 With --rings above 1 the frame is larger (1280 x 960, or 2560 x 1920 above 12 rings),
 since those codes need more pixels.
+
+Frames are written as PNG files to a temporary directory a few dozen at a time and
+scanned by `astracode batch`. Both stages use WORKERS processes or threads (three
+quarters of the cores unless ASTRA_WORKERS says otherwise). Scan times are measured
+one frame at a time inside the scanner's process.
 """
 import glob
 import math
 import os
+import subprocess
 import sys
+import tempfile
 import time
 from multiprocessing import Pool
 
 import cv2
 import numpy as np
 
-from astracode import decode, render, spec
+from astracode import render, spec
 
 # ASTRA_SHADE=0.5 renders the light limbs at another level (the scanner works it out for itself).
 spec.SHADE = float(os.environ.get("ASTRA_SHADE", spec.SHADE))
@@ -40,6 +49,8 @@ def workers(rings):
 FRAME_W, FRAME_H = 960, 720
 SRC_PPU = 3.0
 ROOT = os.path.dirname(os.path.abspath(__file__))
+BINARY = os.path.join(ROOT, "rust", "target", "release", "astracode")
+BATCH = 36      # frames on disk at any one time
 _bgs = None
 
 
@@ -91,6 +102,13 @@ def scene_background(rng):
     return img
 
 
+def project(H, pts):
+    """Points through a homography."""
+    p = pts @ H[:2, :2].T + H[:2, 2]
+    w = pts @ H[2, :2] + H[2, 2]
+    return p / w[:, None]
+
+
 def placement(rng, diameter, tilt_deg, half=spec.HALF):
     """Homography from code model units to frame pixels, for a tilted plane seen by a pinhole camera."""
     f = 1.1 * FRAME_W
@@ -106,7 +124,7 @@ def placement(rng, diameter, tilt_deg, half=spec.HALF):
     K = np.array([[f, 0, 0], [0, f, 0], [0, 0, 1]])
     H = K @ np.column_stack([Rm[:, 0], Rm[:, 1], [0, 0, dist]])
     H = H / H[2, 2]
-    corners = decode._apply(H, np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]], float) * half)
+    corners = project(H, np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]], float) * half)
     lo, hi = corners.min(0), corners.max(0)
     span = hi - lo
     if span[0] > FRAME_W - 8 or span[1] > FRAME_H - 8:
@@ -173,11 +191,12 @@ def make_case(seed, level=1.0, rings=(1, 1), wavy=0.0):
     rng = np.random.default_rng(seed)
     extra = np.random.default_rng(seed + 5 * 10 ** 8)
     center_label, center = random_center(extra)
-    mirrored = extra.random() < 0.15
+    # ASTRA_MIRRORED=1 makes every frame a mirror image (normally 15% are).
+    mirrored = extra.random() < (1.0 if os.environ.get("ASTRA_MIRRORED") else 0.15)
     n_rings = int(extra.integers(rings[0], rings[1] + 1))
     ec_level = int(extra.integers(0, spec.LEVELS))
     half = spec.half_side(n_rings)
-    number = int(rng.integers(0, spec.MAX_NUMBER))
+    number = int(rng.integers(0, 109 * 10 ** 10))      # the range is historical: it keeps old seeds' frames the same
     ink, bgc = random_colours(rng)
     while True:
         # The same range of star sizes whatever the number of rings, as far as the frame allows.
@@ -187,11 +206,15 @@ def make_case(seed, level=1.0, rings=(1, 1), wavy=0.0):
         if H is not None:
             break
     px_per_unit = diameter / (2 * half)
+    # What the code holds, as (length in bits, the bits as an integer), like a scan result's key.
     if n_rings == 1:
-        expected, code = number, number
+        # Half the one-ring codes are full (38 bits, as an Astra number is), the rest any length.
+        nbits = 38 if number & 1 else (number >> 1) % 39
+        expected = (nbits, (number >> 8) & ((1 << nbits) - 1))
     else:
-        expected = extra.bytes(int(extra.integers(0, spec.capacity(n_rings, ec_level) + 1)))
-        code = spec.encode_message(expected, n_rings, ec_level)
+        data = extra.bytes(int(extra.integers(0, spec.capacity(n_rings, ec_level) + 1)))
+        expected = (8 * len(data), int.from_bytes(data, "big"))
+    code = spec.encode_bits(expected[1], expected[0], ec_level, n_rings)
     SRC_PPU = 3.0 if n_rings <= 8 else 1.5         # big codes are rendered smaller, to bound memory
     code = render.render(code, SRC_PPU, ink, bgc, supersample=3 if n_rings <= 8 else 2, **center)
     if mirrored:
@@ -259,7 +282,7 @@ def make_case(seed, level=1.0, rings=(1, 1), wavy=0.0):
     img = np.clip(img, 0, 255).astype(np.uint8)
     q = int(rng.uniform(100 - 65 * min(level, 1.0), 95))
     img = cv2.imdecode(cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, q])[1], cv2.IMREAD_COLOR)
-    meta = dict(seed=seed, number=expected, rings=n_rings, ec=ec_level, star_px=39.0 * px_per_unit, diameter=diameter, tilt=tilt, blur=blur_units, motion=motion_units,
+    meta = dict(seed=seed, key=expected, rings=n_rings, ec=ec_level, star_px=39.0 * px_per_unit, diameter=diameter, tilt=tilt, blur=blur_units, motion=motion_units,
                 noise=noise, jpeg=q, gamma=gamma, center=center_label, mirrored=mirrored, contrast=abs(luma(ink) - luma(bgc)), H=H)
     return img, meta
 
@@ -271,26 +294,66 @@ def make_negative(seed):
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
-def run_case(args):
-    seed, level, rings, wavy = args
-    img, meta = make_case(seed, level, rings, wavy)
-    start = time.perf_counter()
-    found = decode.scan(img)
-    meta["seconds"] = time.perf_counter() - start
-    if not found:
-        meta["result"] = "miss"
-    elif len(found) == 1 and found[0]["key"] == meta["number"]:
-        meta["result"] = "ok"
-        meta["repaired"] = found[0]["repaired"]
-        if found[0]["mirrored"] != meta["mirrored"]:
-            meta["result"] = "wrong"
+def prepare(args):
+    """Make one frame and save it. Returns what is known about it, for scoring."""
+    kind, seed, level, rings, wavy, folder = args
+    if kind == "code":
+        img, meta = make_case(seed, level, rings, wavy)
+        meta["path"] = os.path.join(folder, "code_%05d.png" % seed)
     else:
-        meta["result"] = "wrong"
+        img, meta = make_negative(seed), dict(seed=seed, key=None, path=os.path.join(folder, "none_%07d.png" % seed))
+    cv2.imwrite(meta["path"], img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
     return meta
 
 
-def run_negative(seed):
-    return len(decode.scan(make_negative(seed)))
+def parse(line):
+    """One line of `astracode batch` output -> (path, seconds, [dict(key, mirrored, repaired)])."""
+    fields = line.rstrip("\n").split("\t")
+    found = []
+    for at in range(2, len(fields), 7):
+        bits, payload, _rings, _level, mirrored, repaired = fields[at:at + 6]
+        bits, payload = int(bits), bytes.fromhex("" if payload == "-" else payload)
+        # The payload is printed as bytes, the last one padded with zero bits.
+        key = (bits, int.from_bytes(payload, "big") >> (8 * len(payload) - bits))
+        found.append(dict(key=key, mirrored=mirrored == "1", repaired=int(repaired)))
+    return fields[0], float(fields[1]), found
+
+
+def score(meta, found):
+    """Fill in a frame's result: ok, miss or wrong."""
+    if not found:
+        meta["result"] = "miss"
+    elif len(found) == 1 and found[0]["key"] == meta["key"] and found[0]["mirrored"] == meta["mirrored"]:
+        meta["result"] = "ok"
+        meta["repaired"] = found[0]["repaired"]
+    else:
+        meta["result"] = "wrong"
+
+
+def scan_all(jobs, rings):
+    """Make and scan every frame, a batch at a time. Returns the frames' rows and the time spent scanning.
+
+    Frames are deleted as soon as they have been scanned: large ones are 10 MB each
+    as PNG, and hundreds of them fill a disk.
+    """
+    rows, elapsed = [], 0.0
+    with tempfile.TemporaryDirectory() as folder, Pool(workers(rings)) as pool:
+        listing = os.path.join(folder, "frames.txt")
+        for at in range(0, len(jobs), BATCH):
+            batch = pool.map(prepare, [job + (folder,) for job in jobs[at:at + BATCH]], chunksize=1)
+            with open(listing, "w") as f:
+                f.write("\n".join(r["path"] for r in batch) + "\n")
+            start = time.perf_counter()
+            out = subprocess.run([BINARY, "batch", listing, "--threads", str(WORKERS)], capture_output=True, text=True)
+            elapsed += time.perf_counter() - start
+            if out.returncode:
+                sys.exit(out.stderr)
+            for row, line in zip(batch, out.stdout.splitlines()):
+                path, row["seconds"], row["found"] = parse(line)
+                assert path == row["path"]
+                os.remove(path)
+            rows += batch
+    return rows, elapsed
 
 
 def groups(rows, key, label):
@@ -330,18 +393,26 @@ def main():
         del args[i:i + 2]
     count = int(args[0]) if args else 1000
     level = float(args[1]) if len(args) > 1 else 1.0
-    with Pool(workers(rings)) as pool:
-        rows = pool.map(run_case, [(s, level, rings, wavy) for s in range(count)], chunksize=4)
-        neg = pool.map(run_negative, range(10 ** 6, 10 ** 6 + count // 2), chunksize=8)
+    if not os.path.exists(BINARY):
+        sys.exit("build the scanner first: (cd rust && cargo build --release)")
+    jobs = [("code", s, level, rings, wavy) for s in range(count)]
+    jobs += [("none", s, level, rings, wavy) for s in range(10 ** 6, 10 ** 6 + count // 2)]
+    every, elapsed = scan_all(jobs, rings)
+    rows = [r for r in every if r["key"] is not None]
+    neg = [r for r in every if r["key"] is None]
+    for r in rows:
+        score(r, r["found"])
     ok = sum(r["result"] == "ok" for r in rows)
     wrong = [r for r in rows if r["result"] == "wrong"]
-    print(f"decoded {ok}/{count} ({100 * ok / count:.1f}%), wrong number {len(wrong)}, "
-          f"needed a star repaired {sum(r.get('repaired', 0) for r in rows)}")
-    print(f"false positives on {len(neg)} code-free frames: {sum(n > 0 for n in neg)}")
-    for label, sel in (("read", [r for r in rows if r["result"] == "ok"]), ("missed", [r for r in rows if r["result"] == "miss"])):
+    print(f"decoded {ok}/{count} ({100 * ok / count:.1f}%), wrong {len(wrong)}, "
+          f"stars or star pairs repaired {sum(r.get('repaired', 0) for r in rows)}")
+    print(f"false positives on {len(neg)} code-free frames: {sum(bool(r['found']) for r in neg)}")
+    for label, sel in (("read", [r for r in rows if r["result"] == "ok"]), ("missed", [r for r in rows if r["result"] == "miss"]),
+                       ("no code in frame", neg)):
         if sel:
-            t = np.array([r["seconds"] for r in sel])
-            print(f"scan time, {label}: median {np.median(t):.2f}s, 90% under {np.percentile(t, 90):.2f}s, slowest {t.max():.2f}s")
+            t = np.array([r["seconds"] for r in sel]) * 1000
+            print(f"scan time, {label}: median {np.median(t):.0f} ms, 90% under {np.percentile(t, 90):.0f} ms, slowest {t.max():.0f} ms")
+    print(f"the scanner took {elapsed:.1f}s for all {len(every)} frames, PNG decoding included")
     if rings[1] == 1:
         table(rows, "diameter", [90, 130, 180, 250, 350, 560], "code width in px")
     else:

@@ -4,51 +4,70 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** [parseCodes] against bytes laid out the way the native library documents them. */
 class ScannerTest {
-    private fun header(buffer: ByteBuffer, kind: Int, rings: Int, level: Int, flags: Int, repaired: Int) {
-        buffer.put(kind.toByte()).put(rings.toByte()).put(level.toByte()).put(flags.toByte())
+    private fun header(buffer: ByteBuffer, rings: Int, level: Int, flags: Int, repaired: Int) {
+        buffer.put(rings.toByte()).put(level.toByte()).put(flags.toByte())
         buffer.putShort(repaired.toShort()).putFloat(0.6f)
         for (i in 1..8) buffer.putFloat(i * 10f)
     }
 
     @Test
-    fun unpacksBothKindsOfCode() {
+    fun unpacksEveryKindOfPayload() {
         val buffer = ByteBuffer.allocate(256).order(ByteOrder.LITTLE_ENDIAN)
-        buffer.put(3)
-        header(buffer, kind = 0, rings = 1, level = 0, flags = 1, repaired = 1)
-        buffer.put(5).putLong(4_320_880_580L).put("432088058060".toByteArray())
-        header(buffer, kind = 1, rings = 4, level = 2, flags = 2, repaired = 300)
+        buffer.put(4)
+        // An Astra number: 38 bits holding 5 * 10^10 + 4320880580, then what they stand for.
+        header(buffer, rings = 1, level = 0, flags = 1, repaired = 1)
+        val value = 54_320_880_580L shl 2
+        buffer.putInt(38).put(ByteArray(5) { i -> (value shr (8 * (4 - i))).toByte() })
+        buffer.put(1).put(5).putLong(4_320_880_580L).put("432088058060".toByteArray())
+        // Text in several rings.
+        header(buffer, rings = 4, level = 2, flags = 2, repaired = 300)
         val text = "https://astra-europa.example/ é".toByteArray()
-        buffer.putInt(text.size).put(text)
-        header(buffer, kind = 1, rings = 2, level = 0, flags = 0, repaired = 0)
-        buffer.putInt(2).put(byteArrayOf(0xFF.toByte(), 0xFE.toByte()))
+        buffer.putInt(8 * text.size).put(text).put(0)
+        // Bytes that are not text.
+        header(buffer, rings = 1, level = 0, flags = 0, repaired = 0)
+        buffer.putInt(16).put(byteArrayOf(0xFF.toByte(), 0xFE.toByte())).put(0)
+        // Bits that are not bytes.
+        header(buffer, rings = 1, level = 0, flags = 0, repaired = 0)
+        buffer.putInt(11).put(byteArrayOf(0b1010_0000.toByte(), 0b0110_0000)).put(0)
         val codes = parseCodes(buffer.array().copyOf(buffer.position()))
 
-        assertEquals(3, codes.size)
+        assertEquals(4, codes.size)
         val number = codes[0]
-        assertEquals(Payload.Number(5, 4_320_880_580L, "432088058060"), number.payload)
+        assertEquals(AstraNumber(5, 4_320_880_580L, "432088058060"), number.payload.astra)
+        assertEquals(38, number.payload.bitLength)
+        assertNull(number.payload.bytes)
         assertEquals(1, number.rings)
         assertTrue(number.mirrored && !number.bent)
         assertEquals(1, number.repaired)
         assertEquals(0.6f, number.lightLevel)
         assertArrayEquals(floatArrayOf(10f, 20f, 30f, 40f, 50f, 60f, 70f, 80f), number.corners, 0f)
 
-        val message = codes[1].payload as Payload.Message
-        assertEquals("https://astra-europa.example/ é", message.text)
+        val message = codes[1]
+        assertEquals("https://astra-europa.example/ é", message.payload.text)
+        assertNull(message.payload.astra)
         assertEquals(2, message.level)
-        assertEquals(4, codes[1].rings)
-        assertTrue(codes[1].bent && !codes[1].mirrored)
-        assertEquals(300, codes[1].repaired)
+        assertEquals(4, message.rings)
+        assertTrue(message.bent && !message.mirrored)
+        assertEquals(300, message.repaired)
 
         // Bytes that are not text stay bytes.
-        val raw = codes[2].payload as Payload.Message
-        assertNull(raw.text)
-        assertArrayEquals(byteArrayOf(0xFF.toByte(), 0xFE.toByte()), raw.bytes)
+        assertNull(codes[2].payload.text)
+        assertArrayEquals(byteArrayOf(0xFF.toByte(), 0xFE.toByte()), codes[2].payload.bytes)
+
+        // Bits that are not bytes stay bits.
+        assertNull(codes[3].payload.bytes)
+        assertNull(codes[3].payload.text)
+        assertEquals("10100000011", codes[3].payload.bits)
+
+        assertEquals(codes[2].payload, codes[2].payload)
+        assertNotEquals(codes[2].payload, codes[3].payload)
     }
 
     @Test

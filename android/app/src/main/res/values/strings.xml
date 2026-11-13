@@ -18,10 +18,19 @@
 
     <!-- The line under the result. -->
     <string name="detail_number">metadata %1$d · payload %2$s</string>
-    <plurals name="detail_message">
-        <item quantity="one">%2$d rings · %1$d byte · error correction %3$d of 3</item>
-        <item quantity="other">%2$d rings · %1$d bytes · error correction %3$d of 3</item>
+    <plurals name="detail_rings">
+        <item quantity="one">%d ring</item>
+        <item quantity="other">%d rings</item>
     </plurals>
+    <plurals name="detail_bytes">
+        <item quantity="one">%d byte</item>
+        <item quantity="other">%d bytes</item>
+    </plurals>
+    <plurals name="detail_bits">
+        <item quantity="one">%d bit</item>
+        <item quantity="other">%d bits</item>
+    </plurals>
+    <string name="detail_level">error correction %1$d of 3</string>
 
     <!-- How it was read; shown only when something is worth saying. -->
     <string name="note_mirrored">mirror image</string>

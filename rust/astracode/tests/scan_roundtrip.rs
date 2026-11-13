@@ -1,8 +1,9 @@
 //! End to end: draw a code with the generator, turn the drawing into pixels,
 //! distort it the way a camera would, and scan it back.
 
+use astracode::astra::Number;
+use astracode::format::code;
 use astracode::format::svg::{svg, Centre, Style};
-use astracode::format::{message, ring0};
 use astracode::image::Gray;
 use astracode::math::Homography;
 use astracode::scan::{scan_rgb8, Code, Options, Payload};
@@ -62,8 +63,16 @@ fn scan(image: &Rgb) -> Vec<Code> {
     scan_rgb8(image.width, image.height, &image.pixels, &Options::default())
 }
 
-fn one_ring(metadata: u64, payload: u64) -> Vec<Vec<u8>> {
-    vec![ring0::encode(ring0::pack(metadata, payload).unwrap()).unwrap().to_vec()]
+/// The one-ring code of an Astra number.
+fn one_ring(metadata: u8, payload: u64) -> Vec<Vec<u8>> {
+    let rings = code::encode(&Number::new(metadata, payload).unwrap().to_payload(), 1).unwrap();
+    assert_eq!(rings.len(), 1);
+    rings
+}
+
+/// What a scanned code holds, read as an Astra number.
+fn number(code: &Code) -> Option<(u8, u64)> {
+    Number::from_payload(&code.payload).map(|n| (n.metadata, n.payload))
 }
 
 #[test]
@@ -72,7 +81,7 @@ fn a_one_ring_code_scans_straight_and_tilted() {
     let code = render(&one_ring(5, 4_320_880_580), &style);
     for image in [scan(&code), scan(&tilted(&code, 37.0, 0.75)), scan(&tilted(&code, 200.0, 0.5))] {
         assert_eq!(image.len(), 1);
-        assert_eq!(image[0].number(), Some((5, 4_320_880_580)));
+        assert_eq!(number(&image[0]), Some((5, 4_320_880_580)));
         assert_eq!(image[0].rings, 1);
         assert!(!image[0].mirrored);
     }
@@ -82,9 +91,9 @@ fn a_one_ring_code_scans_straight_and_tilted() {
 fn colours_and_the_centre_picture_do_not_matter() {
     for (ink, background, centre) in [("#ffffff", "#20104a", Centre::Logo), ("#0a5d2a", "#e8e0d0", Centre::Empty)] {
         let style = Style { ink: ink.into(), background: background.into(), centre, size: 500, ..Style::default() };
-        let found = scan(&tilted(&render(&one_ring(42, 2_718_281_828), &style), -80.0, 0.8));
+        let found = scan(&tilted(&render(&one_ring(17, 2_718_281_828), &style), -80.0, 0.8));
         assert_eq!(found.len(), 1, "{ink} on {background}");
-        assert_eq!(found[0].number(), Some((42, 2_718_281_828)));
+        assert_eq!(number(&found[0]), Some((17, 2_718_281_828)));
     }
 }
 
@@ -97,29 +106,43 @@ fn a_mirror_image_is_read_and_reported_as_mirrored() {
     }
     let found = scan(&tilted(&flipped, 15.0, 0.9));
     assert_eq!(found.len(), 1);
-    assert_eq!(found[0].number(), Some((1, 5_550_001_112)));
+    assert_eq!(number(&found[0]), Some((1, 5_550_001_112)));
     assert!(found[0].mirrored);
 }
 
 #[test]
-fn a_message_code_scans_at_several_sizes() {
-    for (rings, level, text) in
-        [(2, 3, "hi"), (4, 1, "https://astra-europa.example/"), (9, 2, "nine rings of stars around a small picture")]
-    {
-        let symbols = message::encode(text.as_bytes(), rings, level).unwrap();
+fn a_code_sizes_itself_and_scans_at_several_sizes() {
+    // Text and level, and the number of rings that should come out.
+    for (text, level, rings) in [
+        ("hi", 3, 1),
+        ("hello", 3, 2),
+        ("https://astra-europa.example/", 1, 4),
+        ("nine rings of stars around a small picture, with a little more text to fill them all the way out to the edge", 2, 9),
+    ] {
+        let symbols = code::encode(&Payload::from_bytes(text), level).unwrap();
+        assert_eq!(symbols.len(), rings, "{text:?}");
         let code = render(&symbols, &Style { size: 300 + 110 * rings as u32, ..Style::default() });
         for image in [scan(&code), scan(&tilted(&code, 123.0, 0.55))] {
             assert_eq!(image.len(), 1, "{rings} rings");
-            assert_eq!(image[0].payload, Payload::Message { level, bytes: text.as_bytes().to_vec() });
-            assert_eq!(image[0].rings, rings);
+            assert_eq!(image[0].payload.as_text(), Some(text));
+            assert_eq!((image[0].rings, image[0].level), (rings, if rings == 1 { 0 } else { level }));
+            assert_eq!(number(&image[0]), None);
         }
     }
 }
 
 #[test]
+fn a_small_payload_in_a_bigger_code_scans() {
+    let symbols = code::encode_with_rings(&Payload::from_bytes("hi"), 2, 3).unwrap();
+    let found = scan(&render(&symbols, &Style { size: 700, ..Style::default() }));
+    assert_eq!(found.len(), 1);
+    assert_eq!((found[0].payload.as_text(), found[0].rings, found[0].level), (Some("hi"), 3, 2));
+}
+
+#[test]
 fn ring_0_of_a_bigger_code_is_not_a_code_by_itself() {
     // Paint over everything outside ring 0 of a three-ring code.
-    let symbols = message::encode(b"cropped", 3, 1).unwrap();
+    let symbols = code::encode_with_rings(&Payload::from_bytes("cropped"), 1, 3).unwrap();
     let style = Style { size: 900, ..Style::default() };
     let mut code = render(&symbols, &style);
     let centre = 450.0;

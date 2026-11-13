@@ -1,55 +1,60 @@
-"""Astracode format, version 2 with optional extra rings: geometry, symbol mapping and error-correcting code.
+"""Astracode format: geometry, symbol mapping and error-correcting code.
 
 All lengths are in model units, with the ring of star centres at radius 100
 around the origin; x to the right, y down.
 
 Layout
-  - 12 stars, upright (never rotated), centred on the ring at angles
-    -90 + 30*i degrees: star 0 at 12 o'clock, then clockwise.
-  - Each star is a complete regular pentagram. Its centre pentagon is always
-    solid ink. Each of its five limbs is either solid (bit 1) or a lighter
-    shade, SHADE of the way from background to ink (bit 0). The top limb is
-    bit 4 of the star's 5-bit symbol, then clockwise bits 3, 2, 1, 0.
+  - A code has 1 to MAX_RINGS rings of stars. Ring k has 12 + 6k stars at
+    radius 100 + RING_STEP * k, star 0 at 12 o'clock, then clockwise. Every
+    ring has a star on each of the six spokes at multiples of 60 degrees.
+  - Every star is the same size and upright (never rotated): a complete
+    regular pentagram. Its centre pentagon is always solid ink. Each of its
+    five limbs is either solid (bit 1) or a lighter shade, SHADE of the way
+    from background to ink (bit 0). The top limb is bit 4 of the star's 5-bit
+    symbol, then clockwise bits 3, 2, 1, 0.
   - The centre may hold any picture (or nothing) inside a circle of radius
     CENTER_R. Readers do not look at it. The band between that circle and
     the stars must stay background colour. The Astra logo is drawn in a box
     of side LOGO_D and reaches radius 72.9.
 
-Payload
-  - 40 bits holding metadata * 10^10 + payload: a 10-digit payload (0 ..
-    9 999 999 999) and a metadata value 0 .. 108 saying what the payload is.
-  - That value is scrambled by a fixed, public, reversible mixing step (MIX)
-    so that codes for neighbouring values look unrelated and use both shades
-    evenly. It is not encryption: anyone can undo it.
-  - The scrambled value is stored as 8 symbols, most significant first.
-  - A member ID is 12 digits: 10 digits followed by those 10 digits mod 97.
-    Only the first 10 are stored; the last two are recomputed when reading.
-  - 4 Reed-Solomon check symbols over GF(32) follow (stars 8 to 11). They let
-    a reader repair one misread star and still detect up to three, or repair
-    two stars it already knows to be doubtful.
+What a code carries
+  - A string of bits, usually whole bytes, of any length up to what 24 rings
+    hold. The format gives the bits no meaning; that is up to whoever uses it
+    (astra.py holds Astra's own use). A code has as many rings as its payload
+    needs: up to 38 bits fit in one ring.
+  - The payload is laid out as a stream: the payload's bits, then a 1 bit,
+    then zeros to fill the code.
+
+Ring 0
+  - Its 12 stars hold a 40-bit value in 8 symbols, most significant first,
+    then 4 Reed-Solomon check symbols over GF(32) (stars 8 to 11). The check
+    symbols let a reader repair one misread star and still detect up to
+    three, or repair two stars it already knows to be doubtful.
+  - The value's top bit says whether there are more rings.
+      0: this ring is the whole code. The other 39 bits are the stream.
+      1: then 5 bits, the number of rings minus one (1 .. 23); 2 bits, the
+         error-correction level of the outer rings; and the first 32 bits of
+         the stream.
+    So ring 0 always tells the reader how many rings to expect, and a ring 0
+    cut out of a bigger code does not read as a code of its own.
+  - Before it is split into symbols the value is scrambled by a fixed,
+    public, reversible mixing step (MIX) so that codes for neighbouring
+    values look unrelated and use both shades evenly. It is not encryption:
+    anyone can undo it.
   - The 12 symbols are XORed with MASK before drawing, so no code is a single
     flat shade.
 
-More rings
-  - A code may have up to MAX_RINGS rings. Ring k (the ring above is ring 0)
-    has 12 + 6k stars of the same size at radius 100 + RING_STEP * k, star 0 at
-    12 o'clock, then clockwise. Every ring has a star on each of the six
-    spokes at multiples of 60 degrees.
-  - Ring 0 is read exactly as above. Its 40-bit value says which kind of code
-    this is: below MAX_NUMBER it is a one-ring code as described above; from
-    MAX_NUMBER up it is a header, MAX_NUMBER + (rings << 28 | level << 26 |
-    first 26 message bits). So a ring 0 cut out of a bigger code never reads
-    as a one-ring code, and it tells the reader how many rings to expect.
-  - The stars of rings 1 and up, in order, are taken in pairs as 10-bit
-    symbols (first star = high 5 bits) forming one Reed-Solomon codeword over
-    GF(1024). Level 0..3 makes 1/8, 2/8, 3/8 or 4/8 of those symbols check
-    symbols. The check symbols also cover ring 0's 40-bit value (as four
-    leading symbols that are not drawn again), tying the rings together.
-  - The message is a byte string: its bits, then a 1 bit, then zeros to fill.
+Rings 1 and up
+  - Their stars, in order, are taken in pairs as 10-bit symbols (first star =
+    high 5 bits) forming one Reed-Solomon codeword over GF(1024): the rest of
+    the stream, then check symbols. Level 0..3 makes 1/8, 2/8, 3/8 or 4/8 of
+    the symbols check symbols. The check symbols also cover ring 0's 40-bit
+    value (as four leading symbols that are not drawn again), tying the rings
+    together.
   - Outer symbols are XORed with a fixed pseudo-random sequence before drawing.
 
-Version 1 (limbs present or absent, top limb fixed, 2 check stars) is in git
-history, tagged v1.0.
+Earlier formats are in git history: v0.1.0 (limbs present or absent), v0.2.x
+(one ring holding a number), v0.3.0 (a number in one ring or bytes in several).
 """
 import math
 
@@ -65,9 +70,6 @@ SHADE = 0.7                  # ink fraction of a light limb
 N_STARS = 12
 N_DATA = 8
 N_CHECK = N_STARS - N_DATA
-PAYLOAD_LIMIT = 10 ** 10                      # payloads are 0 .. PAYLOAD_LIMIT - 1
-METADATA_LIMIT = (1 << 40) // PAYLOAD_LIMIT   # 109: metadata is 0 .. 108
-MAX_NUMBER = METADATA_LIMIT * PAYLOAD_LIMIT   # every stored value is below this, and below 2^40
 
 MASK = (0x15, 0x0A, 0x13, 0x1C, 0x09, 0x06, 0x1E, 0x01, 0x17, 0x08, 0x1B, 0x04)
 
@@ -196,63 +198,35 @@ def unmix(value):
     return left << 20 | right
 
 
-# ---------------------------------------------------------------- payload
+# ---------------------------------------------------------------- ring 0
 
-def pack(metadata, payload):
-    """Metadata 0..108 and a 10-digit payload -> the stored value."""
-    if not 0 <= metadata < METADATA_LIMIT:
-        raise ValueError("metadata must be 0..%d" % (METADATA_LIMIT - 1))
-    if not 0 <= payload < PAYLOAD_LIMIT:
-        raise ValueError("payload must have at most 10 digits")
-    return metadata * PAYLOAD_LIMIT + payload
+MAX_RINGS = 24            # 1932 outer stars = 966 symbols, within GF(1024)'s 1023
+LEVELS = 4                # error-correction levels 0..3
+ONE_RING_BITS = 39        # stream bits in ring 0 when it is the whole code
+HEAD_BITS = 32            # stream bits in ring 0 when more rings follow
 
 
-def unpack(value):
-    """Stored value -> (metadata, payload)."""
-    return divmod(value, PAYLOAD_LIMIT)
+def ring0_value(rings, level, head):
+    """Ring 0's 40-bit value: the number of rings, the level, and the first bits of the stream."""
+    if rings == 1:
+        return head
+    return 1 << 39 | (rings - 1) << 34 | level << 32 | head
 
 
-def member_id(payload):
-    """The 12-digit member ID for a 10-digit payload: the payload, then payload mod 97."""
-    return "%010d%02d" % (payload, payload % 97)
-
-
-def payload_of_member_id(text):
-    """12-digit member ID -> its 10-digit payload; ValueError if the last two digits are wrong."""
-    digits = "".join(ch for ch in text if ch.isdigit())
-    if len(digits) != 12 or int(digits[:10]) % 97 != int(digits[10:]):
-        raise ValueError("not a valid member ID")
-    return int(digits[:10])
-
-
-def _encode_value(number):
-    """Any 40-bit value -> the 12 symbols of ring 0 as drawn (masked)."""
-    mixed = mix(number)
+def encode_ring0(value):
+    """A 40-bit value -> the 12 symbols of ring 0 as drawn (masked)."""
+    mixed = mix(value)
     data = [(mixed >> (5 * (N_DATA - 1 - i))) & 31 for i in range(N_DATA)]
     cw = data + rs_parity(data)
     return [c ^ m for c, m in zip(cw, MASK)]
 
 
-def encode(number):
-    """Stored value (see pack) -> the 12 symbols of a one-ring code as drawn."""
-    if not 0 <= number < MAX_NUMBER:
-        raise ValueError("value out of range")
-    return _encode_value(number)
-
-
-def decode_symbols(symbols, doubtful=None):
-    """The 12 symbols of a one-ring code -> (stored value, stars repaired), or None.
+def decode_ring0(symbols, doubtful=None):
+    """The 12 symbols of ring 0 as drawn -> (40-bit value, stars repaired), or None.
 
     Repairs one misread star anywhere. If that fails and `doubtful` names two
-    stars the reader is unsure of, repairs exactly those two instead. Ring 0 of
-    a code with more rings is refused here; see decode_message.
+    stars the reader is unsure of, repairs exactly those two instead.
     """
-    res = _decode_value(symbols, doubtful)
-    return res if res is not None and res[0] < MAX_NUMBER else None
-
-
-def _decode_value(symbols, doubtful=None):
-    """The 12 symbols of ring 0 as drawn -> (40-bit value, stars repaired), or None."""
     cw = [s ^ m for s, m in zip(symbols, MASK)]
     res = rs_correct(cw)
     if res is None and doubtful is not None:
@@ -267,12 +241,24 @@ def _decode_value(symbols, doubtful=None):
     return unmix(mixed), repaired
 
 
+def read_ring0(symbols, doubtful=None):
+    """Ring 0 as drawn -> (rings, level, 40-bit value, stars repaired), or None.
+
+    The level is 0 for a one-ring code, which has no outer check symbols.
+    """
+    res = decode_ring0(symbols, doubtful)
+    if res is None:
+        return None
+    value, repaired = res
+    if not value >> 39:
+        return (1, 0, value, repaired) if value else None      # an all-zero stream has no end
+    rings, level = (value >> 34 & 31) + 1, value >> 32 & 3
+    return (rings, level, value, repaired) if rings <= MAX_RINGS else None
+
+
 # ---------------------------------------------------------------- more rings
 
-MAX_RINGS = 24            # 1932 outer stars = 966 symbols, within GF(1024)'s 1023
 RING_STEP = 40.0          # radius added per ring
-LEVELS = 4                # error-correction levels 0..3
-_HEAD_BITS = 26           # message bits carried in ring 0 of a multi-ring code
 
 _EXP10 = [0] * 2046
 _LOG10 = [0] * 1024
@@ -312,16 +298,34 @@ def outer_symbols(rings):
 
 
 def check_symbols(rings, level):
-    return max(2, -(-outer_symbols(rings) * (level + 1) // 8))
+    """How many of the outer symbols are check symbols. Never fewer than two; none in a one-ring code."""
+    return max(2, -(-outer_symbols(rings) * (level + 1) // 8)) if rings > 1 else 0
 
 
-def capacity_bits(rings, level):
-    return _HEAD_BITS + 10 * (outer_symbols(rings) - check_symbols(rings, level))
+def stream_bits(rings, level=0):
+    """Length of the stream: ring 0's share plus the outer rings' data symbols."""
+    if rings == 1:
+        return ONE_RING_BITS
+    return HEAD_BITS + 10 * (outer_symbols(rings) - check_symbols(rings, level))
 
 
-def capacity(rings, level):
-    """Longest message, in bytes, a code with this many rings (2 or more) holds."""
-    return (capacity_bits(rings, level) - 1) // 8
+def capacity_bits(rings, level=0):
+    """Longest payload, in bits, a code with this many rings holds."""
+    return stream_bits(rings, level) - 1
+
+
+def capacity(rings, level=0):
+    """Longest payload, in whole bytes, a code with this many rings holds."""
+    return capacity_bits(rings, level) // 8
+
+
+def rings_for(nbits, level=1):
+    """The fewest rings that hold a payload of this many bits."""
+    for rings in range(1, MAX_RINGS + 1):
+        if capacity_bits(rings, level) >= nbits:
+            return rings
+    raise ValueError("payload too long: %d rings hold at most %d bits at level %d"
+                     % (MAX_RINGS, capacity_bits(MAX_RINGS, level), level))
 
 
 def _whiten(j):
@@ -421,65 +425,89 @@ def _virtual(value):
     return [(value >> s) & 1023 for s in (30, 20, 10, 0)]
 
 
-def encode_message(message, rings, level=1):
-    """Byte string -> the symbols of every ring as drawn: [ring 0's 12, ring 1's 18, ...]."""
-    if not 2 <= rings <= MAX_RINGS or not 0 <= level < LEVELS:
-        raise ValueError("rings must be 2..%d and level 0..%d" % (MAX_RINGS, LEVELS - 1))
-    total = capacity_bits(rings, level)
-    if 8 * len(message) + 1 > total:
-        raise ValueError("message too long: at most %d bytes" % capacity(rings, level))
+def encode_bits(value, nbits, level=1, rings=None):
+    """A payload of nbits bits, given as an integer -> the symbols of every ring as drawn.
+
+    Returns [ring 0's 12 symbols, ring 1's 18, ...]. The code has the fewest
+    rings that hold the payload, or `rings` if given, which must be enough.
+    `level` is the error-correction level of the outer rings, if there are any.
+    """
+    if not 0 <= level < LEVELS:
+        raise ValueError("level must be 0..%d" % (LEVELS - 1))
+    if nbits < 0 or value < 0 or value >> nbits:
+        raise ValueError("the payload does not fit in %d bits" % nbits)
+    if rings is None:
+        rings = rings_for(nbits, level)
+    elif not 1 <= rings <= MAX_RINGS:
+        raise ValueError("rings must be 1..%d" % MAX_RINGS)
+    elif nbits > capacity_bits(rings, level):
+        raise ValueError("payload too long: at most %d bits" % capacity_bits(rings, level))
+    total = stream_bits(rings, level)
+    stream = (value << 1 | 1) << (total - nbits - 1)
+    if rings == 1:
+        return [encode_ring0(ring0_value(1, 0, stream))]
     p = check_symbols(rings, level)
     d = outer_symbols(rings) - p
-    stream = (int.from_bytes(message, "big") << 1 | 1) << (total - 8 * len(message) - 1)
     data = [(stream >> (10 * (d - 1 - j))) & 1023 for j in range(d)]
-    value = MAX_NUMBER + (rings << 28 | level << 26 | stream >> (10 * d))
-    outer = [c ^ _whiten(j) for j, c in enumerate(data + rs10_parity(_virtual(value) + data, p))]
+    value0 = ring0_value(rings, level, stream >> (10 * d))
+    outer = [c ^ _whiten(j) for j, c in enumerate(data + rs10_parity(_virtual(value0) + data, p))]
     stars = [half for sym in outer for half in (sym >> 5, sym & 31)]
-    out, at = [_encode_value(value)], 0
+    out, at = [encode_ring0(value0)], 0
     for k in range(1, rings):
         out.append(stars[at:at + ring_stars(k)])
         at += ring_stars(k)
     return out
 
 
-def read_header(symbols, doubtful=None):
-    """Ring 0 of a multi-ring code -> (rings, level, 40-bit value, stars repaired), or None."""
-    res = _decode_value(symbols, doubtful)
-    if res is None or res[0] < MAX_NUMBER:
-        return None
-    header = res[0] - MAX_NUMBER
-    rings, level = header >> 28, (header >> 26) & 3
-    return (rings, level, res[0], res[1]) if 2 <= rings <= MAX_RINGS else None
+def encode(data, level=1, rings=None):
+    """Byte string -> the symbols of every ring as drawn; see encode_bits."""
+    return encode_bits(int.from_bytes(data, "big"), 8 * len(data), level, rings)
 
 
-def decode_message(ring_symbols):
-    """Symbols of every ring as drawn -> (message bytes, outer symbols repaired), or None."""
-    header = read_header(ring_symbols[0])
+def decode_bits(ring_symbols):
+    """Symbols of every ring as drawn -> (payload as an integer, its length in bits, outer symbols repaired), or None.
+
+    None if ring 0 does not check out, if the number or size of the rings is
+    not what ring 0 says, or if the outer rings cannot be repaired.
+    """
+    header = read_ring0(ring_symbols[0])
     if header is None:
         return None
     rings, level, value, _ = header
     if len(ring_symbols) != rings or any(len(ring_symbols[k]) != ring_stars(k) for k in range(rings)):
         return None
-    stars = [s for ring in ring_symbols[1:] for s in ring]
-    outer = [(stars[2 * j] << 5 | stars[2 * j + 1]) ^ _whiten(j) for j in range(len(stars) // 2)]
-    p = check_symbols(rings, level)
-    # Two check symbols are always kept back for detection, so that a badly misread
-    # code is refused rather than "repaired" into a different message.
-    res = rs10_decode(_virtual(value) + outer, p, max_errors=(p - 2) // 2)
-    if res is None or res[0][:4] != _virtual(value):
-        return None
-    cw, repaired = res
-    d = len(outer) - p
-    stream = (value - MAX_NUMBER) & ((1 << _HEAD_BITS) - 1)
-    for sym in cw[4:4 + d]:
-        stream = stream << 10 | sym
+    if rings == 1:
+        stream, repaired = value, 0
+    else:
+        stars = [s for ring in ring_symbols[1:] for s in ring]
+        outer = [(stars[2 * j] << 5 | stars[2 * j + 1]) ^ _whiten(j) for j in range(len(stars) // 2)]
+        p = check_symbols(rings, level)
+        # Two check symbols are always kept back for detection, so that a badly misread
+        # code is refused rather than "repaired" into a different payload.
+        res = rs10_decode(_virtual(value) + outer, p, max_errors=(p - 2) // 2)
+        if res is None or res[0][:4] != _virtual(value):
+            return None
+        cw, repaired = res
+        stream = value & ((1 << HEAD_BITS) - 1)
+        for sym in cw[4:4 + len(outer) - p]:
+            stream = stream << 10 | sym
     if stream == 0:
         return None
     pad = (stream & -stream).bit_length()         # the final 1 bit and the zeros after it
-    nbits = capacity_bits(rings, level) - pad
-    if nbits % 8:
+    return stream >> pad, stream_bits(rings, level) - pad, repaired
+
+
+def as_bytes(value, nbits):
+    """A payload as a byte string, or None if it is not a whole number of bytes."""
+    return None if nbits % 8 else value.to_bytes(nbits // 8, "big")
+
+
+def decode(ring_symbols):
+    """Symbols of every ring as drawn -> (payload bytes, outer symbols repaired); None if it is not whole bytes."""
+    res = decode_bits(ring_symbols)
+    if res is None or res[1] % 8:
         return None
-    return (stream >> pad).to_bytes(nbits // 8, "big"), repaired
+    return as_bytes(res[0], res[1]), res[2]
 
 
 # ---------------------------------------------------------------- geometry
@@ -533,13 +561,8 @@ def blend(background, ink, t):
     return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(a, b))
 
 
-def svg(number, ink="#021639", background="#febc5c", size=512):
-    """The one-ring code for a stored value (see pack) as an SVG string."""
-    return svg_rings([encode(number)], ink, background, size)
-
-
 def svg_rings(ring_symbols, ink="#021639", background="#febc5c", size=512):
-    """A code as an SVG string, from the symbols of each ring (see encode_message)."""
+    """A code as an SVG string, from the symbols of each ring (see encode)."""
     half = half_side(len(ring_symbols))
     poly = lambda pts: '<polygon points="%s"/>' % " ".join("%.3f,%.3f" % p for p in pts)
     light = solid = ""

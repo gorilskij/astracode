@@ -1,4 +1,4 @@
-"""Raster rendering of a code, used by the tests and to build the scanner's logo template."""
+"""Raster rendering of a code, used by the benchmark to make its frames."""
 import os
 
 import cv2
@@ -43,9 +43,9 @@ def center_alpha(picture="logo", scale=1.0, rotation=0.0, size=512):
 def alpha(code, px_per_unit=3.0, supersample=3, center="logo", center_scale=1.0, center_rotation=0.0):
     """Ink coverage (0..1 float32) of the full code square, margin included.
 
-    code: a stored value (one-ring code) or the symbols of every ring (spec.encode_message).
+    code: the symbols of every ring, as spec.encode returns them.
     """
-    rings = [spec.encode(code)] if isinstance(code, int) else code
+    rings = code
     half = spec.half_side(len(rings))
     s = px_per_unit * supersample
     side = int(round(2 * half * s))

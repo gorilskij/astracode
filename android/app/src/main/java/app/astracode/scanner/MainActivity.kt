@@ -44,6 +44,9 @@ import kotlin.math.max
  * A one-ring code is accepted when two frames in a row agree on it: it has only four check
  * stars, and the second frame costs a fraction of a second. A code with more rings is
  * protected by its own long codeword and is accepted at once.
+ *
+ * What a code holds is a string of bits. The panel shows it as the most specific thing it
+ * is: an Astra member number, a link, text, bytes, or bare bits.
  */
 class MainActivity : ComponentActivity() {
     private lateinit var preview: PreviewView
@@ -191,7 +194,7 @@ class MainActivity : ComponentActivity() {
             val index = if (codes.isEmpty()) -1 else 0
             val code = codes.firstOrNull()
             val corners = code?.let { toView(it.corners, image.width, image.height, image.imageInfo.rotationDegrees) }
-            val accepted = code != null && (code.payload is Payload.Message || code.payload == pending)
+            val accepted = code != null && (code.rings > 1 || code.payload == pending)
             pending = code?.payload
             if (accepted) paused = true
             val (width, height) = image.width to image.height
@@ -232,49 +235,57 @@ class MainActivity : ComponentActivity() {
         overlay.show(corners, true)
 
         link = null
-        when (val payload = code.payload) {
-            is Payload.Number -> {
-                // Metadata 0 is a member ID: the ten-digit payload and its two check digits.
-                if (payload.metadata == 0) {
-                    kindView.setText(R.string.kind_member_id)
-                    copyText = payload.memberId
-                    numberView.text = payload.memberId.chunked(4).joinToString(" ")
-                } else {
-                    kindView.text = getString(R.string.kind_number, payload.metadata)
-                    copyText = "%010d".format(payload.payload)
-                    numberView.text = copyText.chunked(5).joinToString(" ")
-                }
-                detailView.text = getString(R.string.detail_number, payload.metadata, "%010d".format(payload.payload))
-                numberView.visibility = View.VISIBLE
-                messageScroll.visibility = View.GONE
+        val payload = code.payload
+        val astra = payload.astra
+        if (astra != null) {
+            // Metadata 0 is a member ID: the ten-digit payload and its two check digits.
+            if (astra.metadata == 0) {
+                kindView.setText(R.string.kind_member_id)
+                copyText = astra.memberId
+                numberView.text = astra.memberId.chunked(4).joinToString(" ")
+            } else {
+                kindView.text = getString(R.string.kind_number, astra.metadata)
+                copyText = "%010d".format(astra.payload)
+                numberView.text = copyText.chunked(5).joinToString(" ")
             }
-            is Payload.Message -> {
-                val text = payload.text
-                if (text == null) {
-                    // Not text: show the bytes.
-                    kindView.setText(R.string.kind_data)
-                    copyText = payload.bytes.joinToString(" ") { "%02x".format(it) }
-                    messageView.typeface = android.graphics.Typeface.MONOSPACE
-                } else {
-                    link = text.trim().takeIf { isLink(it) }
-                    kindView.setText(if (link != null) R.string.kind_link else R.string.kind_text)
-                    copyText = text
-                    messageView.typeface = android.graphics.Typeface.DEFAULT
-                }
-                messageView.text = copyText
-                detailView.text = resources.getQuantityString(
-                    R.plurals.detail_message, payload.bytes.size, payload.bytes.size, code.rings, payload.level)
-                numberView.visibility = View.GONE
-                messageScroll.visibility = View.VISIBLE
-                limitHeight(messageScroll, MESSAGE_MAX_HEIGHT_DP)
+            detailView.text = getString(R.string.detail_number, astra.metadata, "%010d".format(astra.payload))
+            numberView.visibility = View.VISIBLE
+            messageScroll.visibility = View.GONE
+        } else {
+            val text = payload.text
+            val bytes = payload.bytes
+            if (text != null) {
+                link = text.trim().takeIf { isLink(it) }
+                kindView.setText(if (link != null) R.string.kind_link else R.string.kind_text)
+                copyText = text
+                messageView.typeface = android.graphics.Typeface.DEFAULT
+            } else {
+                // Not text: show the bytes, or the bare bits if they are not whole bytes.
+                kindView.setText(R.string.kind_data)
+                copyText = bytes?.joinToString(" ") { "%02x".format(it) } ?: payload.bits.chunked(8).joinToString(" ")
+                messageView.typeface = android.graphics.Typeface.MONOSPACE
             }
+            messageView.text = copyText
+            detailView.text = buildList {
+                add(resources.getQuantityString(R.plurals.detail_rings, code.rings, code.rings))
+                if (bytes != null) {
+                    add(resources.getQuantityString(R.plurals.detail_bytes, bytes.size, bytes.size))
+                } else {
+                    add(resources.getQuantityString(R.plurals.detail_bits, payload.bitLength, payload.bitLength))
+                }
+                // Only the rings beyond the first have an error-correction level.
+                if (code.rings > 1) add(getString(R.string.detail_level, code.level))
+            }.joinToString(" · ")
+            numberView.visibility = View.GONE
+            messageScroll.visibility = View.VISIBLE
+            limitHeight(messageScroll, MESSAGE_MAX_HEIGHT_DP)
         }
 
         val notes = buildList {
             if (code.mirrored) add(getString(R.string.note_mirrored))
             if (code.bent) add(getString(R.string.note_bent))
             if (code.repaired > 0) {
-                val which = if (code.payload is Payload.Number) R.plurals.note_repaired_stars else R.plurals.note_repaired_pairs
+                val which = if (code.rings == 1) R.plurals.note_repaired_stars else R.plurals.note_repaired_pairs
                 add(resources.getQuantityString(which, code.repaired, code.repaired))
             }
         }

@@ -8,10 +8,10 @@
 //! 2. `rings`: walk rings of twelve evenly spaced, similar blobs.
 //! 3. `candidate`: fit a homography to a ring, throw out look-alikes
 //!    (`checks`), find which way is up from the star shapes (`align`),
-//!    and read ring 0's limbs (`limbs`). Ring 0 is either a complete
-//!    one-ring code or the header of a bigger one.
+//!    and read ring 0's limbs (`limbs`). Ring 0 says how many rings the
+//!    code has, and may be all of it.
 //! 4. `outer`: for a bigger code, locate the remaining rings outwards from
-//!    ring 0 and read the message.
+//!    ring 0 and read them.
 //! 5. `bent`: when a ring cannot be read as flat, each star's own outline
 //!    gives its local stretch, shear and rotation, and reading is retried
 //!    with those.
@@ -21,6 +21,9 @@
 //!
 //! The scanner is tuned never to return a wrong value: when in doubt it
 //! returns nothing, and the caller scans the next frame.
+//!
+//! A result's payload is a string of bits. What they mean is the caller's
+//! business; see [`crate::astra`] for one convention.
 
 mod align;
 mod bent;
@@ -33,7 +36,7 @@ mod par;
 mod patterns;
 mod rings;
 
-use crate::format::ring0;
+pub use crate::format::Payload;
 use crate::image::Gray;
 use crate::math::{Homography, LocalMap, Point};
 
@@ -41,28 +44,22 @@ use crate::math::{Homography, LocalMap, Point};
 /// for limbs to be read at all.
 pub(crate) const MIN_SHADE_SEPARATION: f64 = 4.0;
 
-/// What a code carries.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Payload {
-    /// A one-ring code: `metadata * 10^10 + payload`. See [`ring0::unpack`] and
-    /// [`ring0::member_id`].
-    Number(u64),
-    /// A code with more rings: a byte string, written at the given error-correction level.
-    Message { level: u8, bytes: Vec<u8> },
-}
-
 /// A code found in an image.
 #[derive(Debug, Clone)]
 pub struct Code {
+    /// What the code carries.
     pub payload: Payload,
     /// Number of rings, 1 to 24.
     pub rings: usize,
+    /// Error-correction level of the outer rings, 0 to 3. Always 0 for a
+    /// one-ring code, which has none.
+    pub level: u8,
     /// The corners of the code's square in the image: top left, top right,
     /// bottom right, bottom left, as the code itself is oriented.
     pub corners: [Point; 4],
     /// Whether the code was seen as a mirror image (through glass, from behind).
     pub mirrored: bool,
-    /// Stars (one-ring code) or star pairs (message) the error correction repaired.
+    /// What the error correction repaired: stars of a one-ring code, star pairs of a bigger one.
     pub repaired: usize,
     /// Whether reading needed each star's own shape: the surface was far from flat.
     pub shaped: bool,
@@ -72,24 +69,6 @@ pub struct Code {
     pub separation: f64,
     /// How inked the light limbs are relative to solid ones, as measured in this image.
     pub light_level: f64,
-}
-
-impl Code {
-    /// The metadata and payload of a one-ring code.
-    pub fn number(&self) -> Option<(u64, u64)> {
-        match self.payload {
-            Payload::Number(value) => Some(ring0::unpack(value)),
-            Payload::Message { .. } => None,
-        }
-    }
-
-    /// The bytes of a message code.
-    pub fn message(&self) -> Option<&[u8]> {
-        match &self.payload {
-            Payload::Message { bytes, .. } => Some(bytes),
-            Payload::Number(_) => None,
-        }
-    }
 }
 
 /// Settings for a scan.
@@ -139,7 +118,7 @@ impl Placement {
 pub(crate) struct Budget {
     /// Rings that passed the first checks.
     plausible: usize,
-    /// Rings that announced more rings. Once one has, no other loop in the
+    /// Ring 0s that announced more rings. Once one has, no other loop in the
     /// frame can be the answer.
     headers: usize,
     /// The scanner has given up on this frame.

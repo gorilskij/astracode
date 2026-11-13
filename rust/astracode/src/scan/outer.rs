@@ -6,9 +6,9 @@ use super::align::{local_fit, Neighbours};
 use super::bent::fit_shapes;
 use super::limbs::{classify, limb_strength, read_levels};
 use super::patterns::{patterns, THIN};
-use super::{Code, Payload, View, MIN_SHADE_SEPARATION};
+use super::{Code, View, MIN_SHADE_SEPARATION};
 use crate::format::ring0::Header;
-use crate::format::{half_side, message, ring_radius, ring_stars, MAX_RINGS, STAR_RO};
+use crate::format::{code, half_side, ring_radius, ring_stars, MAX_RINGS, STAR_RO};
 use crate::image::Gray;
 use crate::math::{add, offset, sub, Homography, LocalMap, Point};
 
@@ -270,11 +270,12 @@ pub(crate) fn read_rings(
             outer_rings.push(symbols[at..at + ring_stars(k)].to_vec());
             at += ring_stars(k);
         }
-        let Some((bytes, repaired)) = message::decode_outer(header, &outer_rings) else { continue };
+        let Some((payload, repaired)) = code::decode_outer(header, &outer_rings) else { continue };
         let half = half_side(rings);
         return Some(Code {
-            payload: Payload::Message { level: header.level, bytes },
+            payload,
             rings,
+            level: header.level,
             corners: [[-half, -half], [half, -half], [half, half], [-half, half]].map(|c| h.apply(c)),
             mirrored,
             repaired,

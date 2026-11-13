@@ -1,7 +1,7 @@
 //! One candidate ring, from twelve blobs to a result.
 //!
 //! This is where the scanner decides what a ring is: not a code at all, a
-//! one-ring code, or ring 0 of a bigger code (in which case [`super::outer`]
+//! whole code, or ring 0 of a bigger code (in which case [`super::outer`]
 //! takes over). The order of work is cheapest first, and flat before bent.
 
 use super::align::{local_fit, locate, orient, refine, Neighbours};
@@ -10,9 +10,9 @@ use super::checks::{band_clear, centre_is_code, quiet, stars_fit};
 use super::limbs::{classify, contrast, limb_strength, read_levels, Reading};
 use super::outer::read_rings;
 use super::patterns::patterns;
-use super::{Budget, Code, Payload, Placement, View, MIN_SHADE_SEPARATION};
+use super::{Budget, Code, Placement, View, MIN_SHADE_SEPARATION};
 use crate::format::ring0::{self, Symbols};
-use crate::format::{half_side, R};
+use crate::format::{code, half_side, R};
 use crate::math::{distance, Homography, LocalMap, Point};
 
 // The check stars repair one misread star anywhere, or else the two least certain
@@ -25,7 +25,7 @@ use crate::math::{distance, Homography, LocalMap, Point};
 const WEAK_CONFIDENCE: f64 = 0.25;
 /// More weak stars than this and ring 0 is not read at all.
 const MAX_WEAK_STARS: usize = 3;
-/// What every other star must reach before the two least certain may be rebuilt.
+/// Below this a star is in doubt. Two stars are rebuilt only if just those two are.
 const CLEAR_CONFIDENCE: f64 = 0.4;
 /// Least contrast, in grey levels, between a star's centre and its background.
 const MIN_CONTRAST: f64 = 6.0;
@@ -60,11 +60,16 @@ fn read_ring0(view: View, stars: &Placement, mirrored: bool) -> Option<Ring0> {
     if reading.separation < MIN_SHADE_SEPARATION || confidence.iter().filter(|&&c| c < WEAK_CONFIDENCE).count() > MAX_WEAK_STARS {
         return None;
     }
-    // Rebuilding the two least certain stars is only safe when every other star is clear,
-    // and never for a mirrored reading, which must need no repair at all.
+    // Rebuilding two stars is only safe when exactly two are in doubt: those two unclear,
+    // every other star clear. If all twelve are clear there is nothing to rebuild; a ring
+    // that still fails its check is then not this code at all (a mirror image read the
+    // wrong way round, say), and overwriting two of its stars would pass the remaining
+    // checks about once in a thousand tries. And never for a mirrored reading, which must
+    // need no repair at all.
     let mut order: Vec<usize> = (0..12).collect();
     order.sort_by(|&a, &b| confidence[a].total_cmp(&confidence[b]));
-    let doubtful = (!mirrored && confidence[order[2]] >= CLEAR_CONFIDENCE).then_some((order[0], order[1]));
+    let two_in_doubt = confidence[order[1]] < CLEAR_CONFIDENCE && confidence[order[2]] >= CLEAR_CONFIDENCE;
+    let doubtful = (!mirrored && two_in_doubt).then_some((order[0], order[1]));
     let symbols: Symbols = reading.symbols().try_into().expect("ring 0 has twelve stars");
     Some(Ring0 { symbols, doubtful, reading })
 }
@@ -90,7 +95,7 @@ impl Bent<'_> {
 }
 
 /// Read ring 0 under the fit `h` (already mirrored if `mirrored`) and, if it
-/// is the header of a bigger code, the rest of the code.
+/// announces more rings, the rest of the code.
 fn read_oriented(view: View, h: &Homography, mirrored: bool, budget: &mut Budget, bent: &mut Bent) -> Option<Code> {
     let p = patterns();
     let mut h = *h;
@@ -99,10 +104,9 @@ fn read_oriented(view: View, h: &Homography, mirrored: bool, budget: &mut Budget
 
     // As a flat ring first.
     let mut read = read_ring0(view, &local_fit(&h, p.ring0(), &found, Neighbours::Ring), mirrored);
-    let mut number = read.as_ref().and_then(|r| ring0::decode(&r.symbols, r.doubtful));
-    let mut header = if number.is_none() { read.as_ref().and_then(|r| ring0::read_header(&r.symbols, r.doubtful)) } else { None };
+    let mut header = read.as_ref().and_then(|r| ring0::read(&r.symbols, r.doubtful));
 
-    if number.is_none() && header.is_none() {
+    if header.is_none() {
         // Not readable as a flat ring. Try it as a bent one: place and shape each star on
         // its own; then, if a ring 1 surrounds it, use that ring's stars as well.
         let (turned, stars) = bent.get(view, mirrored, budget)?;
@@ -114,36 +118,37 @@ fn read_oriented(view: View, h: &Homography, mirrored: bool, budget: &mut Budget
             let Some(ring) = placed.and_then(|stars| read_ring0(view, &stars, mirrored)) else { continue };
             // No rebuilding of two doubtful stars here: this path gives a ring several
             // chances to be read, and that repair is the easiest for noise to pass.
-            number = ring0::decode(&ring.symbols, None);
-            header = if number.is_none() { ring0::read_header(&ring.symbols, None) } else { None };
+            header = ring0::read(&ring.symbols, None);
             read = Some(ring);
-            if number.is_some() || header.is_some() {
+            if header.is_some() {
                 break;
             }
         }
     }
 
-    let Some((value, repaired)) = number else {
-        let header = header?;
-        if mirrored && header.repaired > 0 {
-            return None;
-        }
-        budget.headers += 1;
-        return read_rings(view, &h, mirrored, &header, &found, shapes.as_deref());
-    };
-    // A one-ring code has clear margin outside its stars and, above all, no ring 1. Ring 0
-    // of a bigger code read with a star "repaired" can pass for a one-ring code otherwise.
-    if (mirrored && repaired > 0) || !quiet(view, &h) || with_ring1(view, &h, &found, shapes.as_deref()).is_some() {
+    let header = header?;
+    if mirrored && header.repaired > 0 {
         return None;
     }
+    if header.rings > 1 {
+        budget.headers += 1;
+        return read_rings(view, &h, mirrored, &header, &found, shapes.as_deref());
+    }
+    // A one-ring code has clear margin outside its stars and, above all, no ring 1. Ring 0
+    // of a bigger code read with a star "repaired" can pass for a one-ring code otherwise.
+    if !quiet(view, &h) || with_ring1(view, &h, &found, shapes.as_deref()).is_some() {
+        return None;
+    }
+    let (payload, _) = code::decode_outer(&header, &[])?;
     let reading = read?.reading;
     let half = half_side(1);
     Some(Code {
-        payload: Payload::Number(value),
+        payload,
         rings: 1,
+        level: 0,
         corners: [[-half, -half], [half, -half], [half, half], [-half, half]].map(|c| h.apply(c)),
         mirrored,
-        repaired,
+        repaired: header.repaired,
         shaped: shapes.is_some(),
         confidence: reading.star_confidence().into_iter().fold(f64::INFINITY, f64::min),
         separation: reading.separation,

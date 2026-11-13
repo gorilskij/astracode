@@ -2,8 +2,9 @@
 //!
 //! ```text
 //! astracode scan photo.jpg                       # read the codes in an image
-//! astracode number 4320880580 -o code.svg        # a one-ring code
-//! astracode message --rings 4 "hello" -o code.png
+//! astracode encode "hello" -o code.png           # a code holding text; it gets as many rings as it needs
+//! astracode encode --hex c0ffee -o code.svg      # ... or any bytes
+//! astracode astra 4320880580 -o code.svg         # an Astra member number: always one ring
 //! astracode batch frames.txt                     # one line of results per image, for test harnesses
 //! ```
 
@@ -11,8 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use astracode::astra::Number;
+use astracode::format::code;
 use astracode::format::svg::{svg, Centre, Style};
-use astracode::format::{message, ring0};
 use astracode::scan::{scan_rgb8, Code, Options, Payload};
 use clap::{Args, Parser, Subcommand};
 
@@ -39,32 +41,38 @@ enum Command {
     },
     /// Scan every image listed in a file (one path per line) and print one
     /// tab-separated line per image: path, seconds, then for each code found
-    /// its kind (`number` or `message`), value (decimal, or hex bytes), rings,
-    /// level, mirrored, repaired, shaped.
+    /// its payload's length in bits, the payload as hex bytes (the last byte
+    /// padded with zero bits; `-` if empty), rings, level, mirrored, repaired,
+    /// shaped.
     Batch {
         list: PathBuf,
         #[command(flatten)]
         scanning: Scanning,
     },
-    /// Draw a one-ring code.
-    Number {
-        /// Up to ten digits.
-        payload: u64,
-        /// What the payload is, 0 to 108.
-        #[arg(long, default_value_t = 0)]
-        metadata: u64,
+    /// Draw a code holding text or bytes. It gets as many rings as that needs:
+    /// one ring holds four bytes.
+    Encode {
+        /// The text to store, as UTF-8; with --hex, bytes written as hex digits.
+        data: String,
+        /// Read DATA as hex digits rather than text.
+        #[arg(long)]
+        hex: bool,
+        /// Error-correction level of the rings beyond the first, 0 (least) to 3 (most).
+        #[arg(long, default_value_t = 1)]
+        level: u8,
+        /// Draw this many rings even if fewer would hold the data, 1 to 24.
+        #[arg(long)]
+        rings: Option<usize>,
         #[command(flatten)]
         drawing: Drawing,
     },
-    /// Draw a code with several rings carrying a text message.
-    Message {
-        text: String,
-        /// Number of rings, 2 to 24.
-        #[arg(long)]
-        rings: usize,
-        /// Error-correction level, 0 (least) to 3 (most).
-        #[arg(long, default_value_t = 1)]
-        level: u8,
+    /// Draw the one-ring code of an Astra member number.
+    Astra {
+        /// The number: up to ten digits, or a 12-digit member ID.
+        number: String,
+        /// What the number is, 0 to 26.
+        #[arg(long, default_value_t = 0)]
+        metadata: u8,
         #[command(flatten)]
         drawing: Drawing,
     },
@@ -111,17 +119,31 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn unhex(digits: &str) -> Result<Vec<u8>, String> {
+    let digits: String = digits.chars().filter(|c| !c.is_whitespace()).collect();
+    if digits.len() % 2 != 0 || !digits.is_ascii() {
+        return Err("hex data must be pairs of hex digits".into());
+    }
+    (0..digits.len() / 2)
+        .map(|i| u8::from_str_radix(&digits[2 * i..2 * i + 2], 16).map_err(|_| "hex data must be pairs of hex digits".to_string()))
+        .collect()
+}
+
+/// What a payload holds, for a person to read.
+fn describe_payload(payload: &Payload) -> String {
+    if let Some(number) = Number::from_payload(payload) {
+        return format!("Astra number, metadata {}, payload {:010} (member ID {})", number.metadata, number.payload, number.member_id());
+    }
+    match (payload.as_text(), payload.as_bytes()) {
+        (Some(text), _) => format!("{text:?}"),
+        (None, Some(bytes)) => format!("{} bytes, hex {}", bytes.len(), hex(bytes)),
+        (None, None) => format!("{} bits: {}", payload.len(), payload.bits().map(|b| if b { '1' } else { '0' }).collect::<String>()),
+    }
+}
+
 fn describe(code: &Code) -> String {
-    let what = match &code.payload {
-        Payload::Number(value) => {
-            let (metadata, payload) = ring0::unpack(*value);
-            format!("metadata {metadata}, payload {payload:010} (member ID {})", ring0::member_id(payload))
-        }
-        Payload::Message { level, bytes } => match std::str::from_utf8(bytes) {
-            Ok(text) => format!("{} rings, level {level}: {text:?}", code.rings),
-            Err(_) => format!("{} rings, level {level}: {} bytes, hex {}", code.rings, bytes.len(), hex(bytes)),
-        },
-    };
+    let size = if code.rings == 1 { "1 ring".to_string() } else { format!("{} rings, level {}", code.rings, code.level) };
+    let what = format!("{size}: {}", describe_payload(&code.payload));
     let mut notes = Vec::new();
     if code.mirrored {
         notes.push("mirrored".to_string());
@@ -167,15 +189,11 @@ fn batch(list: &Path, options: &Options) -> Result<(), String> {
         let took = start.elapsed().as_secs_f64();
         let mut fields = vec![line.to_string(), format!("{took:.6}")];
         for code in &codes {
-            let (kind, value, level) = match &code.payload {
-                Payload::Number(value) => ("number", value.to_string(), 0),
-                Payload::Message { level, bytes } => ("message", if bytes.is_empty() { "-".into() } else { hex(bytes) }, *level),
-            };
             fields.extend([
-                kind.to_string(),
-                value,
+                code.payload.len().to_string(),
+                if code.payload.is_empty() { "-".into() } else { hex(code.payload.padded_bytes()) },
                 code.rings.to_string(),
-                level.to_string(),
+                code.level.to_string(),
                 (code.mirrored as u8).to_string(),
                 code.repaired.to_string(),
                 (code.shaped as u8).to_string(),
@@ -220,17 +238,34 @@ fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Scan { images, scanning, time, repeat } => scan(&images, &options(&scanning)?, time, repeat),
         Command::Batch { list, scanning } => batch(&list, &options(&scanning)?),
-        Command::Number { payload, metadata, drawing } => {
-            let value = ring0::pack(metadata, payload).map_err(|e| e.to_string())?;
-            let symbols = ring0::encode(value).map_err(|e| e.to_string())?;
-            draw(&[symbols.to_vec()], &drawing)?;
-            println!("member ID {}", ring0::member_id(payload));
+        Command::Encode { data, hex, level, rings, drawing } => {
+            let bytes = if hex { unhex(&data)? } else { data.into_bytes() };
+            let payload = Payload::from_bytes(bytes);
+            let symbols = match rings {
+                Some(rings) => code::encode_with_rings(&payload, level, rings),
+                None => code::encode(&payload, level),
+            }
+            .map_err(|e| e.to_string())?;
+            draw(&symbols, &drawing)?;
+            let rings = symbols.len();
+            let room = code::capacity(rings, level);
+            println!("{} of {room} bytes used in {rings} {}", payload.len() / 8, if rings == 1 { "ring" } else { "rings" });
             Ok(())
         }
-        Command::Message { text, rings, level, drawing } => {
-            let symbols = message::encode(text.as_bytes(), rings, level).map_err(|e| e.to_string())?;
+        Command::Astra { number, metadata, drawing } => {
+            let digits = number.chars().filter(char::is_ascii_digit).count();
+            let number = if digits == 12 {
+                Number::from_member_id(metadata, &number)
+            } else {
+                Number::new(
+                    metadata,
+                    number.trim().parse().map_err(|_| "the number must be up to ten digits, or a 12-digit member ID".to_string())?,
+                )
+            }
+            .map_err(|e| e.to_string())?;
+            let symbols = code::encode(&number.to_payload(), 0).map_err(|e| e.to_string())?;
             draw(&symbols, &drawing)?;
-            println!("{} of {} bytes used", text.len(), message::capacity(rings, level));
+            println!("member ID {}", number.member_id());
             Ok(())
         }
     }

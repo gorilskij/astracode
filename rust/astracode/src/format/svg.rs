@@ -62,9 +62,8 @@ fn polygon(points: &[Point]) -> String {
     format!("<polygon points=\"{}\"/>", list.join(" "))
 }
 
-/// A code as an SVG document, from the symbols of each ring: one ring for a
-/// one-ring code ([`super::ring0::encode`]) or all of them for a message
-/// ([`super::message::encode`]).
+/// A code as an SVG document, from the symbols of each ring as
+/// [`super::code::encode`] returns them.
 pub fn svg(rings: &[Vec<u8>], style: &Style) -> String {
     let half = half_side(rings.len());
     let (mut light, mut solid) = (String::new(), String::new());

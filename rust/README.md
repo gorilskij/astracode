@@ -1,9 +1,15 @@
 # Astracode in Rust
 
-The production implementation of Astracode: the format, a generator and the
-scanner. It is a port of the Python reference in `../astracode/`, which remains
-the place where the algorithm is worked out; this is the one meant to ship on
-phones, on the web and on servers.
+The reference implementation of Astracode: the format, a generator and the
+scanner. This is the one that ships on phones, on the web and on servers, and
+the one that is developed.
+
+The scanner is the only one there is. It began as a Python prototype, which
+was removed once this one had caught up with it (it is in git history up to
+`v0.3.0`). Python is still used for two things: a description of the format
+(`../astracode/spec.py`, `astra.py`), which writes the test vectors this
+library is checked against, and the benchmark (`../bench.py`), which makes
+distorted frames and scans them with this scanner.
 
 ```
 rust/
@@ -16,23 +22,41 @@ rust/
 
 ```sh
 cargo build --release
-target/release/astracode number 4320880580 --metadata 5 -o code.svg
-target/release/astracode message --rings 4 "https://example.org/" -o code.png
+target/release/astracode encode "https://example.org/" -o code.png   # as many rings as it needs
+target/release/astracode encode --hex c0ffee -o code.svg             # any bytes; up to 4 fit in one ring
+target/release/astracode astra 4320880580 --metadata 5 -o code.svg   # an Astra member number: one ring
 target/release/astracode scan --time photo.jpg
 ```
 
 From Rust:
 
 ```rust
-use astracode::scan::{scan_rgb8, Options, Payload};
+use astracode::astra::Number;
+use astracode::format::{code, Payload};
+use astracode::scan::{scan_rgb8, Options};
 
+// Making a code: the payload decides how many rings it gets.
+let rings = code::encode(&Payload::from_bytes("hello"), 1)?;      // error-correction level 1
+let svg = astracode::format::svg::svg(&rings, &Default::default());
+
+// Reading codes.
 for code in scan_rgb8(width, height, &rgb_pixels, &Options::default()) {
-    match code.payload {
-        Payload::Number(value) => println!("one ring: {value}"),
-        Payload::Message { bytes, .. } => println!("{} rings: {} bytes", code.rings, bytes.len()),
+    if let Some(number) = Number::from_payload(&code.payload) {
+        println!("Astra member {}", number.member_id());
+    } else if let Some(text) = code.payload.as_text() {
+        println!("{} rings: {text}", code.rings);
+    } else {
+        println!("{} rings: {} bits", code.rings, code.payload.len());
     }
 }
 ```
+
+A code holds a `Payload`: a string of bits, usually whole bytes, that the
+format gives no meaning. It has as many rings as the payload needs; one ring
+holds 38 bits. `astra` is one convention on top, kept out of the format and
+the scanner: a payload of exactly 38 bits is an Astra number (metadata and a
+ten-digit payload), which therefore always fills one ring and can never be
+mistaken for a byte string.
 
 `scan_gray` takes a single brightness plane, which is what a camera preview
 gives and avoids the colour-channel fallback. `Options::find_size` looks for
@@ -59,7 +83,8 @@ rustup target add aarch64-linux-android
 
 | Module | What it is |
 |---|---|
-| `format` | The code itself, with no image code: constants and ring layout (`mod.rs`), finite fields (`gf`), Reed-Solomon (`reed_solomon`), the scramble (`mix`), ring 0 and one-ring codes (`ring0`), multi-ring messages (`message`), star geometry (`geometry`), SVG output (`svg`). |
+| `format` | The code itself, with no image code: constants and ring layout (`mod.rs`), the payload as a string of bits (`payload`), finite fields (`gf`), Reed-Solomon (`reed_solomon`), the scramble (`mix`), ring 0 (`ring0`), a whole code from payload to stars and back (`code`), star geometry (`geometry`), SVG output (`svg`). |
+| `astra` | Astra's own use of the code: a member number in one ring. Nothing else depends on it. |
 | `image` | A grey `f32` image: sampling, blurs, shrinking, perspective warp. |
 | `math` | Points, local linear maps, homographies (fit, compose, invert). |
 | `scan` | The scanner. |
@@ -67,9 +92,10 @@ rustup target add aarch64-linux-android
 The format is described at the top of `format/mod.rs`. In short: ring `k` has
 `12 + 6k` identical upright stars at radius `100 + 40k`; each star's five limbs
 are solid or a lighter shade, five bits per star. Ring 0 holds a 40-bit value
-protected by four check stars. Either that value is a complete one-ring code,
-or it is a header announcing more rings, whose stars together form one long
-Reed-Solomon codeword carrying a byte string.
+protected by four check stars: how many rings the code has, and the first bits
+of the payload. If the payload is short enough (38 bits) that is the whole
+code; otherwise the stars of the other rings together form one long
+Reed-Solomon codeword carrying the rest.
 
 ## How the scanner works
 
@@ -82,9 +108,10 @@ Reed-Solomon codeword carrying a byte string.
 3. **`candidate`** For each ring: fit a homography; reject look-alikes
    (**`checks`**); find which of the twelve rotations is upright from the star
    outlines and refine the fit (**`align`**); read ring 0's limbs
-   (**`limbs`**). The result is a one-ring code, a header, or nothing.
-4. **`outer`** For a header: locate the remaining rings outwards from ring 0,
-   each from its already located neighbours, and decode the message.
+   (**`limbs`**). Ring 0 says how many rings there are; the result is a
+   whole one-ring code, the start of a bigger one, or nothing.
+4. **`outer`** For a bigger code: locate the remaining rings outwards from
+   ring 0, each from its already located neighbours, and decode them.
 5. **`bent`** When a ring cannot be read as flat: fit each star's own
    outline, which gives its local stretch, shear and rotation, and settles
    the ring's rotation; then read again.
@@ -111,22 +138,22 @@ Things worth knowing before changing it:
 ## Testing
 
 ```sh
-cargo test                 # unit tests, format vectors from the Python reference,
+cargo test                 # unit tests, format vectors written by the Python format description,
                            # and end-to-end tests that draw, distort and scan codes
 ```
 
-The Python benchmark can drive this scanner on exactly the frames it uses for
-the reference, and compare the two:
+The benchmark makes distorted frames in Python and scans them with this
+scanner:
 
 ```sh
 cargo build --release
-../.venv/bin/python ../tools/rust_bench.py 300                # one ring
-../.venv/bin/python ../tools/rust_bench.py 150 --rings 6-12
-../.venv/bin/python ../tools/rust_bench.py 300 --wavy 0.3     # bent surfaces
+../.venv/bin/python ../bench.py 300                # one ring
+../.venv/bin/python ../bench.py 150 --rings 6-12
+../.venv/bin/python ../bench.py 300 --wavy 0.3     # bent surfaces
 ```
 
-At the time of writing both scanners read the same number of frames in every
-set, with no wrong reads.
+It reports how many frames were read, missed and read wrongly (which must be
+none), scan times, and the read rate by star size, tilt, blur and so on.
 
 ## Performance
 
