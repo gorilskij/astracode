@@ -12,16 +12,27 @@
 //! directions of its limbs are the same in both.
 
 use super::geometry::{limb_solid, star_center, Point};
-use super::{half_side, SHADE, STAR_RO};
+use super::{half_side, CENTER_R, SHADE, STAR_RO};
 
 /// What to draw in the middle of the code. Readers ignore it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Centre {
     /// The Astra Europa mark.
     #[default]
     Logo,
     /// Nothing.
     Empty,
+    /// Any picture, drawn into a square by an SVG `<image>` (so it can be a PNG,
+    /// JPEG or SVG, typically as a `data:` URL), scaled to keep its aspect ratio.
+    Picture {
+        /// The picture's address: what goes in `href`.
+        href: String,
+        /// How far from the middle of its square the picture paints, as a fraction of
+        /// half the square's side: 1 for a disc that fills the square, about 1.41 for
+        /// a picture that fills it to the corners. This is what is sized to
+        /// [`Style::centre_size`].
+        reach: f64,
+    },
 }
 
 /// How to draw a code.
@@ -37,11 +48,14 @@ pub struct Style {
     /// Width and height of the image in pixels.
     pub size: u32,
     pub centre: Centre,
+    /// How far the centre picture reaches from the middle, as a fraction of
+    /// [`CENTER_R`], the most it may: 1 at most.
+    pub centre_size: f64,
 }
 
 impl Default for Style {
     fn default() -> Self {
-        Style { ink: "#021639".into(), background: "#febc5c".into(), shade: SHADE, size: 512, centre: Centre::Logo }
+        Style { ink: "#021639".into(), background: "#febc5c".into(), shade: SHADE, size: 512, centre: Centre::Logo, centre_size: 1.0 }
     }
 }
 
@@ -53,8 +67,10 @@ const LOGO_PATHS: [&str; 3] = [
 ];
 const LOGO_SRC: f64 = 3840.0;
 const LOGO_TRANSFORM: &str = "translate(744.90 729.60) scale(2.671645) translate(-14.05 -91.42)";
-/// Side of the box the source drawing is scaled into. The mark itself reaches radius 72.9.
+/// Side of the box the source drawing is scaled into at full size. The mark itself
+/// then reaches [`LOGO_REACH`] from the middle.
 const LOGO_D: f64 = 180.0;
+const LOGO_REACH: f64 = 72.9;
 
 /// The colour `t` of the way from `background` to `ink`, both `#rrggbb`.
 fn blend(background: &str, ink: &str, t: f64) -> String {
@@ -143,12 +159,23 @@ pub fn svg(rings: &[Vec<u8>], style: &Style) -> String {
             solid.push_str(&solid_path(symbol, center));
         }
     }
-    let picture = match style.centre {
+    // The radius the centre picture reaches.
+    let reach = style.centre_size.clamp(0.0, 1.0) * CENTER_R;
+    let picture = match &style.centre {
         Centre::Empty => String::new(),
         Centre::Logo => {
-            let k = LOGO_D / LOGO_SRC;
+            let k = LOGO_D / LOGO_SRC * reach / LOGO_REACH;
             let paths: String = LOGO_PATHS.iter().map(|d| format!("<path d=\"{d}\"/>")).collect();
             format!("<g transform=\"scale({k}) translate({o} {o}) {LOGO_TRANSFORM}\">{paths}</g>", o = -LOGO_SRC / 2.0)
+        }
+        Centre::Picture { href, reach: own } => {
+            let half = reach / own.max(1e-6);
+            let href = href.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;");
+            format!(
+                "<image x=\"{min}\" y=\"{min}\" width=\"{side}\" height=\"{side}\" preserveAspectRatio=\"xMidYMid meet\" href=\"{href}\"/>",
+                min = -half,
+                side = 2.0 * half
+            )
         }
     };
     format!(
@@ -183,6 +210,20 @@ mod tests {
         // 30 solid parts, and five light limbs for each of the 18 all-light stars.
         assert_eq!(out.matches("<path").count(), 30 + 18 * 5);
         assert!(out.contains("viewBox=\"-175.5 -175.5 351 351\""));
+    }
+
+    #[test]
+    fn a_centre_picture_is_sized_by_how_far_it_reaches() {
+        let style = |centre| Style { centre, centre_size: 0.5, ..Style::default() };
+        // A disc that fills its square, at half the most the centre allows: a square of side 73.
+        let out = svg(&[vec![31u8; 12]], &style(Centre::Picture { href: "data:image/png;base64,AA==\"x".into(), reach: 1.0 }));
+        assert!(out.contains("<image x=\"-36.5\" y=\"-36.5\" width=\"73\" height=\"73\""), "{out}");
+        assert!(out.contains("href=\"data:image/png;base64,AA==&quot;x\""));
+        // The mark, likewise: half its full size.
+        let half = svg(&[vec![31u8; 12]], &style(Centre::Logo));
+        let full = svg(&[vec![31u8; 12]], &Style::default());
+        let k = |out: &str| -> f64 { out.split("scale(").nth(1).unwrap().split(')').next().unwrap().parse().unwrap() };
+        assert!((k(&half) / k(&full) - 0.5).abs() < 1e-9);
     }
 
     #[test]

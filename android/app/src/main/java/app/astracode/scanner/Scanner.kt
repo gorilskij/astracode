@@ -71,7 +71,7 @@ class ScannedCode(
 
 /**
  * Unpack what [NativeScanner.scan] returns. The layout is documented with the function that
- * writes it, `encode` in `rust/astracode-android/src/lib.rs`: little-endian, a count, then per
+ * writes it, `pack` in `rust/astracode/src/packed.rs`: little-endian, a count, then per
  * code a fixed header, the corners, the payload, and the Astra number if the payload is one.
  */
 fun parseCodes(packed: ByteArray?): List<ScannedCode> {

@@ -180,6 +180,9 @@ struct Drawing {
     /// Leave the centre empty instead of drawing the logo.
     #[arg(long)]
     no_logo: bool,
+    /// Size of the logo, in percent of the most the centre allows.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=100))]
+    logo_size: u32,
 }
 
 fn load(path: &Path) -> Result<image::RgbImage, String> {
@@ -287,6 +290,7 @@ fn draw(rings: &[Vec<u8>], drawing: &Drawing) -> Result<(), String> {
         shade: drawing.light as f64 / 100.0,
         size: drawing.size,
         centre: if drawing.no_logo { Centre::Empty } else { Centre::Logo },
+        centre_size: drawing.logo_size as f64 / 100.0,
     };
     let document = svg(rings, &style);
     let path = &drawing.output;
