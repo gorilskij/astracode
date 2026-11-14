@@ -36,9 +36,10 @@ mod par;
 mod patterns;
 mod rings;
 
+use crate::format::geometry::inside;
 pub use crate::format::Payload;
 use crate::image::Gray;
-use crate::math::{Homography, LocalMap, Point};
+use crate::math::{distance, Homography, LocalMap, Point};
 
 /// Least gap between the light and solid shades, in units of their spread,
 /// for limbs to be read at all.
@@ -121,8 +122,14 @@ pub(crate) struct Budget {
     /// Ring 0s that announced more rings. Once one has, no other loop in the
     /// frame can be the answer.
     headers: usize,
-    /// The scanner has given up on this frame.
+    /// Some part of the frame offered more plausible rings than a code would.
     gave_up: bool,
+    /// The scanner has given up on this frame.
+    stop: bool,
+    /// Parts of the frame that need no more looking at, as centre and radius in pixels: a
+    /// code whose ring 0 was found but whose rings could not be read, or a crowd of stars
+    /// with no readable ring among them. Another code in the frame may still be read.
+    spent: Vec<(Point, f64)>,
     /// Rings given the bent-surface treatment.
     bent: usize,
     /// The frame offered so many loops of twelve that it must be full of texture or noise.
@@ -134,8 +141,9 @@ pub(crate) struct Budget {
 /// texture that fills one pass with chance loops must not keep the scanner
 /// from the pass that has the code's stars.
 const MAX_LOOPS: usize = 100;
-/// Loops per image plane that may pass the first checks, which is where the
-/// work starts, before giving up on the frame.
+/// Loops that may pass the first checks, which is where the work starts,
+/// before giving up: on the crowd of stars they are in, if they are in one
+/// (a code that cannot be read; there may be another in the frame), or else on the frame.
 const MAX_PLAUSIBLE: usize = 30;
 /// A plane that offers more loops than this in all is texture or noise, and
 /// its colour channels are not worth trying one by one.
@@ -168,55 +176,107 @@ fn scan_plane(gray: &Gray, options: &Options, budget: &mut Budget) -> Vec<Code> 
 
     let mut results: Vec<Code> = Vec::new();
     let mut tried: Vec<candidate::Marks> = Vec::new();
-    let (mut loops_in_all, plausible_before) = (0usize, budget.plausible);
+    let mut loops_in_all = 0usize;
+    let middle_of_frame = [gray.width as f64 / 2.0, gray.height as f64 / 2.0];
     // First only blobs with few similar neighbours, which is quick and finds a code on
     // its own; then more crowded ones; last everything, which a code with several
     // rings needs, since all its stars are crowded.
-    for max_crowd in [rings::CROWD, 2 * rings::CROWD, usize::MAX] {
+    'stages: for max_crowd in [rings::CROWD, 2 * rings::CROWD, usize::MAX] {
         for (polarity, blobs, neighbourhood) in &passes {
             let view = View { image: gray, polarity: *polarity };
-            let (mut loops, mut finished) = (0usize, false);
-            rings::find_rings(neighbourhood, max_crowd, |ring| {
+            // The allowances are counted afresh for each crowd of stars, and for the blobs in none.
+            let (mut loops, mut plausible_before, mut finished) = (0usize, budget.plausible, false);
+            let mut crowd: Option<(Point, f64)> = None;
+            rings::find_rings(neighbourhood, max_crowd, [small.width as f64 / 2.0, small.height as f64 / 2.0], |found| {
+                let ring = match found {
+                    rings::Found::Group(group) => {
+                        crowd = group.map(|c| ([c.middle[0] / scale, c.middle[1] / scale], c.reach / scale));
+                        (loops, plausible_before) = (0, budget.plausible);
+                        // A crowd already given up on, as another pass saw it.
+                        let spent = crowd.is_some_and(|(middle, _)| budget.spent.iter().any(|&(at, reach)| distance(at, middle) < reach));
+                        return if spent { rings::Next::Leave } else { rings::Next::Go };
+                    }
+                    rings::Found::Ring(ring) => ring,
+                };
                 loops += 1;
                 loops_in_all += 1;
                 budget.textured |= loops_in_all > TEXTURED_LOOPS;
-                if budget.plausible - plausible_before > MAX_PLAUSIBLE {
-                    budget.gave_up = true;
-                }
-                if budget.headers > 0 || budget.gave_up {
+                if budget.stop {
                     finished = true;
-                    return false;
+                    return rings::Next::Stop;
                 }
-                if loops > MAX_LOOPS {
-                    // Texture or noise: leave it, the code's stars may be in another pass.
-                    return false;
+                let plausible = budget.plausible - plausible_before;
+                if loops > MAX_LOOPS || plausible > MAX_PLAUSIBLE {
+                    // Texture or noise, or a code that cannot be read. Leave it: the code's
+                    // stars may be in another crowd, or in another pass.
+                    budget.gave_up |= plausible > MAX_PLAUSIBLE;
+                    match crowd.take() {
+                        Some(zone) => budget.spent.push(zone),
+                        None if plausible > MAX_PLAUSIBLE => {
+                            budget.stop = true;
+                            finished = true;
+                            return rings::Next::Stop;
+                        }
+                        None => {}
+                    }
+                    return rings::Next::Leave;
                 }
                 let centres: Vec<Point> = ring.blobs.iter().map(|&i| [blobs[i as usize].x / scale, blobs[i as usize].y / scale]).collect();
                 let areas: Vec<f64> = ring.blobs.iter().map(|&i| blobs[i as usize].area / (scale * scale)).collect();
-                if let Some(code) = candidate::read_candidate(view, &centres, &ring.slots, &areas, &mut tried, budget) {
-                    if results.iter().all(|r| r.payload != code.payload) {
-                        results.push(code);
+                let count = centres.len() as f64;
+                let middle = [centres.iter().map(|c| c[0]).sum::<f64>() / count, centres.iter().map(|c| c[1]).sum::<f64>() / count];
+                if budget.spent.iter().any(|&(at, reach)| distance(at, middle) < reach) {
+                    return rings::Next::Go;
+                }
+                let headers_before = budget.headers;
+                match candidate::read_candidate(view, &centres, &ring.slots, &areas, &mut tried, budget) {
+                    Some(code) => {
+                        if results.iter().all(|r| r.payload != code.payload) {
+                            results.push(code);
+                        }
                     }
+                    // Ring 0 of a code whose other rings could not be read. No other loop
+                    // of that code can be the answer; a loop elsewhere in the frame can.
+                    None if budget.headers > headers_before => {
+                        let in_crowd = crowd.is_some();
+                        let radius = centres.iter().map(|&c| distance(c, middle)).fold(0.0, f64::max);
+                        budget.spent.push(crowd.take().unwrap_or((middle, 3.0 * radius)));
+                        return if in_crowd { rings::Next::Leave } else { rings::Next::Go };
+                    }
+                    None => {}
                 }
                 // In the slow pass one code is enough.
                 if !results.is_empty() && max_crowd == usize::MAX {
                     finished = true;
-                    return false;
+                    return rings::Next::Stop;
                 }
-                true
+                rings::Next::Go
             });
             if finished {
-                return results;
+                break 'stages;
             }
         }
-        if !results.is_empty() || budget.headers > 0 {
+        // A code over the middle of the frame is the one being pointed at. With only codes
+        // off to the side so far, a bigger one in the middle may still be waiting for the
+        // slower stages.
+        if results.iter().any(|code| inside(&code.corners, middle_of_frame)) || budget.stop {
             break;
         }
     }
+    // The code nearest the middle of the frame first.
+    let from_middle = |code: &Code| {
+        let centre = [0, 1].map(|k| code.corners.iter().map(|c| c[k]).sum::<f64>() / 4.0);
+        distance(centre, middle_of_frame)
+    };
+    results.sort_by(|a, b| from_middle(a).total_cmp(&from_middle(b)));
     results
 }
 
 /// Find and read the codes in a grey image.
+///
+/// With several codes in the image, the one nearest its middle comes first: that
+/// is the one a camera is being pointed at. A code with several rings ends the
+/// search, so others further from the middle may go unreported.
 pub fn scan_gray(gray: &Gray, options: &Options) -> Vec<Code> {
     scan_plane(gray, options, &mut Budget::default())
 }
@@ -225,6 +285,7 @@ pub fn scan_gray(gray: &Gray, options: &Options) -> Vec<Code> {
 ///
 /// Brightness is tried first. If that finds nothing, each colour channel is
 /// tried on its own, for ink and background colours that are alike in brightness.
+/// The order of the codes is that of [`scan_gray`].
 pub fn scan_rgb8(width: usize, height: usize, pixels: &[u8], options: &Options) -> Vec<Code> {
     let mut budget = Budget::default();
     let results = scan_plane(&Gray::from_rgb8(width, height, pixels), options, &mut budget);
@@ -234,7 +295,7 @@ pub fn scan_rgb8(width: usize, height: usize, pixels: &[u8], options: &Options) 
     for channel in [2, 1, 0] {
         // If brightness showed a ring 0 whose outer rings could not be read, or a crowd of
         // stars with no readable ring among them, the single channels will not do better.
-        if budget.headers > 0 || budget.gave_up || budget.textured {
+        if budget.headers > 0 || budget.gave_up || budget.stop || budget.textured {
             break;
         }
         let results = scan_plane(&Gray::from_rgb8_channel(width, height, pixels, channel), options, &mut budget);

@@ -168,6 +168,71 @@ fn light_stars_that_look_bigger_than_they_are_still_scan() {
     }
 }
 
+/// A picture out of focus: each channel blurred.
+fn blurred(image: &Rgb, sigma: f64) -> Rgb {
+    let mut pixels = vec![0u8; image.pixels.len()];
+    for channel in 0..3 {
+        let plane = Gray::from_rgb8_channel(image.width, image.height, &image.pixels, channel).gaussian_blur(sigma);
+        for (i, v) in plane.data.iter().enumerate() {
+            pixels[3 * i + channel] = v.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    Rgb { width: image.width, height: image.height, pixels }
+}
+
+#[test]
+fn a_code_is_read_with_part_of_a_bigger_one_beside_it() {
+    // A five-ring code with a slice of a 24-ring code along the frame's edge, as when a
+    // phone is pointed at one of several codes on a page. The slice offers hundreds of
+    // small stars and no ring 0, only look-alike loops, which in a photo (light stars a
+    // little bigger than they are, nothing quite sharp) pass the first checks one after
+    // another. The scanner has to give up on that crowd of stars, not on the frame.
+    let text = "five rings, with a crowd of small stars at the edge";
+    let big: Vec<u8> = (0..900).map(|i| (i * 7 % 251) as u8).collect();
+    let far_symbols = code::encode(&Payload::from_bytes(big), 1).unwrap();
+    assert_eq!(far_symbols.len(), 24);
+    for (near_size, far_size, slice, grown, blur) in [(900, 420, 300, 1, 1.5), (1100, 520, 380, 2, 2.0)] {
+        let near_style = Style { size: near_size, ink: "#ffc2e2".into(), background: "#2b0b45".into(), ..Style::default() };
+        let near = render(&code::encode(&Payload::from_bytes(text), 1).unwrap(), &near_style);
+        let far = render(&far_symbols, &Style { size: far_size, ink: "#c8c8c8".into(), background: "#3a3a3a".into(), ..Style::default() });
+        // The five-ring code on the left, and the left part of the other against its right edge.
+        let (w, h) = (near.width + slice, near.height);
+        let mut pixels = vec![0x3au8; 3 * w * h];
+        for y in 0..h {
+            pixels[3 * y * w..3 * (y * w + near.width)].copy_from_slice(&near.pixels[3 * y * near.width..3 * (y + 1) * near.width]);
+            if y < far.height {
+                let part = &far.pixels[3 * y * far.width..3 * (y * far.width + slice)];
+                pixels[3 * (y * w + near.width)..3 * (y * w + near.width + slice)].copy_from_slice(part);
+            }
+        }
+        let found = scan(&blurred(&bloomed(&Rgb { width: w, height: h, pixels }, grown), blur));
+        assert_eq!(found.len(), 1, "codes of {near_size} and {far_size} pixels");
+        assert_eq!(found[0].payload.as_text(), Some(text));
+    }
+}
+
+#[test]
+fn the_code_in_the_middle_of_the_frame_comes_first() {
+    // A one-ring code off to the left, which is found first because it is the quickest
+    // to find, and a five-ring code in the middle, which is the one being pointed at.
+    let text = "the code in the middle";
+    let middle = render(&code::encode(&Payload::from_bytes(text), 1).unwrap(), &Style { size: 600, ..Style::default() });
+    let side = render(&one_ring(0, 1234567890), &Style { size: 220, ..Style::default() });
+    let (w, h) = (side.width + middle.width + side.width, middle.height);
+    let mut pixels = vec![0xd9u8; 3 * w * h];
+    for y in 0..h {
+        let at = 3 * (y * w + side.width);
+        pixels[at..at + 3 * middle.width].copy_from_slice(&middle.pixels[3 * y * middle.width..3 * (y + 1) * middle.width]);
+        if (40..40 + side.height).contains(&y) {
+            pixels[3 * y * w..3 * (y * w + side.width)].copy_from_slice(&side.pixels[3 * (y - 40) * side.width..3 * (y - 39) * side.width]);
+        }
+    }
+    let found = scan(&Rgb { width: w, height: h, pixels });
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[0].payload.as_text(), Some(text));
+    assert_eq!(number(&found[1]), Some((0, 1234567890)));
+}
+
 #[test]
 fn a_small_payload_in_a_bigger_code_scans() {
     let symbols = code::encode_with_rings(&Payload::from_bytes("hi"), 2, 3).unwrap();

@@ -219,6 +219,88 @@ impl Neighbourhood {
     }
 }
 
+/// A crowd of like blobs standing close together: the stars of one code with several rings.
+pub(crate) struct Crowd {
+    /// The middle of the crowd, which is where a code's ring 0 is.
+    pub middle: Point,
+    /// How far from the middle its blobs reach.
+    pub reach: f64,
+}
+
+/// What [`find_rings`] reports to its caller,
+pub(crate) enum Found {
+    /// that it is about to look among the blobs of this crowd (or, with `None`, among those in no crowd),
+    Group(Option<Crowd>),
+    /// or a ring it has found there.
+    Ring(Ring),
+}
+
+/// and what the caller wants next.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Next {
+    /// Carry on.
+    Go,
+    /// Leave this group of blobs and go on to the next.
+    Leave,
+    /// Stop looking.
+    Stop,
+}
+
+/// Blobs of a crowd are linked when they are within this many times the distance to
+/// the nearer one's nearest neighbour. Within a code a star's neighbours are 40 to 52
+/// units away; the stars of two codes side by side, each with its clear margin, are 71
+/// units apart at least.
+const LINK: f64 = 1.35;
+
+/// The crowds among the blobs, the one nearest `focus` first, each with its blobs
+/// listed from its middle outwards.
+///
+/// Two codes in one frame are two crowds. Each is searched from its own middle, where
+/// its ring 0 is: from anywhere else there are only look-alike loops to be found. And
+/// the one in the middle of the frame is the one being pointed at.
+fn crowds(nb: &Neighbourhood, focus: Point) -> Vec<(Crowd, Vec<u32>)> {
+    let n = nb.len();
+    let dense = |i: usize| nb.crowd[i] > CROWD;
+    let gap = |i: usize, j: usize| (nb.pts[i][0] - nb.pts[j][0]).hypot(nb.pts[i][1] - nb.pts[j][1]);
+    let nearest: Vec<f64> = (0..n).map(|i| nb.near[i].first().map_or(f64::INFINITY, |&j| gap(i, j as usize))).collect();
+    // Linked blobs end up in one tree of this forest.
+    fn root(parent: &mut [u32], mut i: u32) -> u32 {
+        while parent[i as usize] != i {
+            parent[i as usize] = parent[parent[i as usize] as usize];
+            i = parent[i as usize];
+        }
+        i
+    }
+    let mut parent: Vec<u32> = (0..n as u32).collect();
+    for i in (0..n).filter(|&i| dense(i)) {
+        for &j in &nb.near[i] {
+            if dense(j as usize) && gap(i, j as usize) <= LINK * nearest[i].max(nearest[j as usize]) {
+                let (a, b) = (root(&mut parent, i as u32), root(&mut parent, j));
+                parent[a.max(b) as usize] = a.min(b);
+            }
+        }
+    }
+    let mut members: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for i in (0..n as u32).filter(|&i| dense(i as usize)) {
+        members[root(&mut parent, i) as usize].push(i);
+    }
+    let mut found: Vec<(f64, Crowd, Vec<u32>)> = members
+        .into_iter()
+        .filter(|blobs| blobs.len() >= 12)
+        .map(|mut blobs| {
+            let median = |of: &dyn Fn(usize) -> f64| crate::math::median(&blobs.iter().map(|&i| of(i as usize)).collect::<Vec<f64>>());
+            let middle = [median(&|i| nb.pts[i][0]), median(&|i| nb.pts[i][1])];
+            let from_focus = (middle[0] - focus[0]).hypot(middle[1] - focus[1]);
+            let from_middle = |i: u32| (nb.pts[i as usize][0] - middle[0]).hypot(nb.pts[i as usize][1] - middle[1]);
+            blobs.sort_by(|&a, &b| from_middle(a).total_cmp(&from_middle(b)));
+            let reach = blobs.last().map_or(0.0, |&i| from_middle(i));
+            (from_focus, Crowd { middle, reach }, blobs)
+        })
+        .collect();
+    found.sort_by(|a, b| a.0.total_cmp(&b.0));
+    found.into_iter().map(|(_, crowd, blobs)| (crowd, blobs)).collect()
+}
+
 /// A closed ring of twelve places, some of which have a blob.
 pub(crate) struct Ring {
     /// Indices of the blobs found, in walking order.
@@ -311,15 +393,17 @@ impl<F: FnMut(&[i32; 12]) -> bool> Walker<'_, F> {
 }
 
 /// Find closed rings of twelve evenly spaced, similar blobs, and hand each to
-/// `found`. `found` returns false to stop the search.
+/// `found`, which says what to do next.
 ///
 /// Blobs with more than `max_crowd` similar neighbours are skipped: in a dense
 /// regular texture (screen pixel grids, halftone, fabric) every blob has many,
 /// and they would support endless false rings. With `max_crowd = usize::MAX`
-/// nothing is skipped, which is what a code with several rings needs; that
-/// search starts from the middle of the crowd, where ring 0 is, because
-/// everything further out only offers look-alike loops.
-pub(crate) fn find_rings(nb: &Neighbourhood, max_crowd: usize, mut found: impl FnMut(Ring) -> bool) {
+/// nothing is skipped, which is what a code with several rings needs. That
+/// search goes crowd by crowd (see [`crowds`]), the one nearest `focus` first
+/// and each from its middle, where ring 0 is, because everything further out
+/// only offers look-alike loops; `found` is told as each crowd is begun, and
+/// may leave it at any point.
+pub(crate) fn find_rings(nb: &Neighbourhood, max_crowd: usize, focus: Point, mut found: impl FnMut(Found) -> Next) {
     let n = nb.len();
     if n < 12 - MAX_MISSING {
         return;
@@ -327,23 +411,53 @@ pub(crate) fn find_rings(nb: &Neighbourhood, max_crowd: usize, mut found: impl F
     let crowded = |i: u32| nb.crowd[i as usize] > max_crowd;
 
     // Largest blobs first, so that real stars are tried before fine texture.
-    let mut order: Vec<u32> = (0..n as u32).collect();
-    order.sort_by(|&a, &b| nb.size[b as usize].total_cmp(&nb.size[a as usize]));
-    let dense: Vec<Point> = (0..n).filter(|&i| nb.crowd[i] > CROWD).map(|i| nb.pts[i]).collect();
-    if max_crowd == usize::MAX && dense.len() >= 12 {
-        let median = |axis: usize| crate::math::median(&dense.iter().map(|p| p[axis]).collect::<Vec<f64>>());
-        let middle = [median(0), median(1)];
-        let d2 = |i: u32| (nb.pts[i as usize][0] - middle[0]).powi(2) + (nb.pts[i as usize][1] - middle[1]).powi(2);
-        order.sort_by(|&a, &b| d2(a).total_cmp(&d2(b)));
+    let mut rest: Vec<u32> = (0..n as u32).collect();
+    rest.sort_by(|&a, &b| nb.size[b as usize].total_cmp(&nb.size[a as usize]));
+    let mut groups: Vec<(Option<Crowd>, Vec<u32>)> = Vec::new();
+    if max_crowd == usize::MAX {
+        let mut taken = vec![false; n];
+        for (crowd, blobs) in crowds(nb, focus) {
+            blobs.iter().for_each(|&i| taken[i as usize] = true);
+            groups.push((Some(crowd), blobs));
+        }
+        rest.retain(|&i| !taken[i as usize]);
     }
+    groups.push((None, rest));
 
     // Rings reported so far (as sorted blob lists), and which of them each blob is in.
     let mut seen: Vec<Vec<u32>> = Vec::new();
     let mut ring_of: Vec<Vec<u32>> = vec![Vec::new(); n];
-    let mut budget = WALK_BUDGET;
-    let mut stopped = false;
+    for (crowd, order) in groups {
+        match found(Found::Group(crowd)) {
+            Next::Go => {}
+            Next::Leave => continue,
+            Next::Stop => return,
+        }
+        // Each group has its own allowance of steps: one crowd must not use up another's.
+        let mut budget = WALK_BUDGET;
+        let mut next = Next::Go;
+        find_in_group(nb, &order, &crowded, &mut seen, &mut ring_of, &mut budget, &mut next, &mut found);
+        if next == Next::Stop {
+            return;
+        }
+    }
+}
 
-    for &b in &order {
+/// The search of [`find_rings`] among one group of blobs, starting a walk from each in the order given.
+#[allow(clippy::too_many_arguments)]
+fn find_in_group(
+    nb: &Neighbourhood,
+    order: &[u32],
+    crowded: &impl Fn(u32) -> bool,
+    seen: &mut Vec<Vec<u32>>,
+    ring_of: &mut [Vec<u32>],
+    budget_left: &mut i64,
+    next: &mut Next,
+    found: &mut impl FnMut(Found) -> Next,
+) {
+    let mut budget = *budget_left;
+    let mut stopped = false;
+    for &b in order {
         if nb.near[b as usize].len() < 2 || crowded(b) || budget < 0 || stopped {
             continue;
         }
@@ -392,7 +506,8 @@ pub(crate) fn find_rings(nb: &Neighbourhood, max_crowd: usize, mut found: impl F
                         for &i in &blobs {
                             ring_of[i as usize].push(seen.len() as u32);
                         }
-                        found(Ring { blobs, slots })
+                        *next = found(Found::Ring(Ring { blobs, slots }));
+                        *next == Next::Go
                     },
                 };
                 walker.walk(&mut vec![a as i32, b as i32, c as i32], &mut vec![pa, pb, pc], 0, size);
@@ -401,6 +516,7 @@ pub(crate) fn find_rings(nb: &Neighbourhood, max_crowd: usize, mut found: impl F
             }
         }
     }
+    *budget_left = budget;
 }
 
 #[cfg(test)]
@@ -496,9 +612,11 @@ mod tests {
         blobs.push(Blob { x: 50.0, y: 50.0, area: 380.0 }); // clutter
         let nb = Neighbourhood::new(&blobs);
         let mut rings = Vec::new();
-        find_rings(&nb, CROWD, |ring| {
-            rings.push(ring);
-            true
+        find_rings(&nb, CROWD, [0.0, 0.0], |found| {
+            if let Found::Ring(ring) = found {
+                rings.push(ring);
+            }
+            Next::Go
         });
         assert_eq!(rings.len(), 1);
         assert_eq!(rings[0].blobs.len(), 12);
@@ -506,12 +624,60 @@ mod tests {
     }
 
     #[test]
+    fn two_codes_in_a_frame_are_two_crowds() {
+        // The stars of a five-ring code, and beside it a three-ring code a third of the
+        // size with its clear margin, as two codes printed side by side are.
+        let code = |rings: usize, at: Point, unit: f64| -> Vec<Blob> {
+            (0..rings)
+                .flat_map(|k| crate::format::geometry::ring_centers(k))
+                .map(|c| Blob { x: at[0] + unit * c[0], y: at[1] + unit * c[1], area: 427.0 * unit * unit })
+                .collect()
+        };
+        let small_at = [800.0 + 2.0 * crate::format::half_side(5) + 0.7 * crate::format::half_side(3), 700.0];
+        let mut blobs = code(5, [800.0, 700.0], 2.0);
+        blobs.extend(code(3, small_at, 0.7));
+        let nb = Neighbourhood::new(&blobs);
+        let found = crowds(&nb, [900.0, 600.0]);
+        assert_eq!(found.len(), 2);
+        // The code nearer the point of interest first, each crowd centred on its own code
+        // and listed from the middle: ring 0's twelve stars before any other.
+        for ((crowd, members), (at, unit)) in found.iter().zip([([800.0, 700.0], 2.0), (small_at, 0.7)]) {
+            assert!((crowd.middle[0] - at[0]).abs() < 30.0 * unit && (crowd.middle[1] - at[1]).abs() < 30.0 * unit);
+            let from_centre = |i: u32| (nb.pts[i as usize][0] - at[0]).hypot(nb.pts[i as usize][1] - at[1]) / unit;
+            assert!(members[..12].iter().all(|&i| (from_centre(i) - 100.0).abs() < 1.0));
+        }
+        assert_eq!(found[0].1.len(), 12 + 18 + 24 + 30 + 36);
+
+        // With the other code nearer, the other way round.
+        assert!((crowds(&nb, small_at)[0].0.middle[0] - small_at[0]).abs() < 30.0);
+
+        // And the search reports them in that order, with ring 0 of each found at once.
+        let mut events = Vec::new();
+        find_rings(&nb, usize::MAX, [900.0, 600.0], |found| {
+            events.push(match found {
+                Found::Group(Some(crowd)) => format!("crowd at {:.0}", crowd.middle[0]),
+                Found::Group(None) => "the rest".to_string(),
+                Found::Ring(ring) => format!("ring of {}", ring.blobs.len()),
+            });
+            // Leave each crowd after its first ring.
+            if events.last().is_some_and(|e| e.starts_with("ring")) {
+                Next::Leave
+            } else {
+                Next::Go
+            }
+        });
+        assert_eq!(events[..4], ["crowd at 800", "ring of 12", &format!("crowd at {:.0}", small_at[0]), "ring of 12"]);
+    }
+
+    #[test]
     fn a_ring_with_stars_missing_is_still_found() {
         let nb = Neighbourhood::new(&ring_blobs(&[4, 9]));
         let mut rings = Vec::new();
-        find_rings(&nb, CROWD, |ring| {
-            rings.push(ring);
-            true
+        find_rings(&nb, CROWD, [0.0, 0.0], |found| {
+            if let Found::Ring(ring) = found {
+                rings.push(ring);
+            }
+            Next::Go
         });
         assert!(!rings.is_empty());
         assert_eq!(rings[0].blobs.len(), 10);
